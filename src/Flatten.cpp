@@ -17,16 +17,22 @@
 //
 //===----------------------------------------------------------------------===//
 
+#include "llvm/IR/Constants.h"
 #include "llvm/IR/Function.h"
+#include "llvm/IR/GlobalVariable.h"
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/Instructions.h"
+#include "llvm/IR/Module.h"
 #include "llvm/IR/PassManager.h"
 #include "llvm/Passes/PassBuilder.h"
 #include "llvm/Passes/PassPlugin.h"
 #include "llvm/Support/CommandLine.h"
 #include "llvm/Support/raw_ostream.h"
 #include "llvm/Transforms/Utils/Local.h"
+#include "llvm/Transforms/Utils/ModuleUtils.h"
 
+#include <cstdint>
+#include <cstdlib>
 #include <random>
 #include <vector>
 
@@ -182,11 +188,117 @@ struct FlattenPass : PassInfoMixin<FlattenPass> {
   static bool isRequired() { return true; }
 };
 
+//===----------------------------------------------------------------------===//
+// String-literal encryption
+//
+// Each private constant i8 string global is XOR-encrypted in the object with a
+// per-string keystream (key + index), the global is made writable, and a single
+// shared decrypt routine is registered as a global constructor so the strings are
+// restored in memory before main runs. Statically the file holds only ciphertext;
+// the plaintext exists only at runtime -- the shape rust-deobf's dynamic/emulation
+// engines are built to recover, and `strings` / FLOSS are not.
+//===----------------------------------------------------------------------===//
+
+// A shared helper: void xor(i8* p, i64 len, i8 key) { for i: p[i] ^= key + (i8)i; }
+static Function *getXorHelper(Module &M) {
+  LLVMContext &Ctx = M.getContext();
+  if (Function *F = M.getFunction("rustcloak.xor"))
+    return F;
+  Type *I8 = Type::getInt8Ty(Ctx), *I64 = Type::getInt64Ty(Ctx);
+  Type *I8P = PointerType::getUnqual(Ctx);
+  FunctionType *FT = FunctionType::get(Type::getVoidTy(Ctx), {I8P, I64, I8}, false);
+  Function *F = Function::Create(FT, GlobalValue::InternalLinkage, "rustcloak.xor", M);
+  Argument *P = F->getArg(0), *Len = F->getArg(1), *Key = F->getArg(2);
+
+  BasicBlock *Entry = BasicBlock::Create(Ctx, "entry", F);
+  BasicBlock *Cond = BasicBlock::Create(Ctx, "cond", F);
+  BasicBlock *Body = BasicBlock::Create(Ctx, "body", F);
+  BasicBlock *Exit = BasicBlock::Create(Ctx, "exit", F);
+
+  IRBuilder<> B(Entry);
+  AllocaInst *I = B.CreateAlloca(I64, nullptr, "i");
+  B.CreateStore(ConstantInt::get(I64, 0), I);
+  B.CreateBr(Cond);
+
+  B.SetInsertPoint(Cond);
+  Value *iv = B.CreateLoad(I64, I, "iv");
+  B.CreateCondBr(B.CreateICmpULT(iv, Len), Body, Exit);
+
+  B.SetInsertPoint(Body);
+  Value *ptr = B.CreateGEP(I8, P, iv);
+  Value *b = B.CreateLoad(I8, ptr);
+  Value *ks = B.CreateAdd(Key, B.CreateTrunc(iv, I8));
+  B.CreateStore(B.CreateXor(b, ks), ptr);
+  B.CreateStore(B.CreateAdd(iv, ConstantInt::get(I64, 1)), I);
+  B.CreateBr(Cond);
+
+  B.SetInsertPoint(Exit);
+  B.CreateRetVoid();
+  return F;
+}
+
+struct StrEncPass : PassInfoMixin<StrEncPass> {
+  PreservedAnalyses run(Module &M, ModuleAnalysisManager &) {
+    LLVMContext &Ctx = M.getContext();
+    std::mt19937 rng(0x5c10a4u ^ std::hash<std::string>{}(M.getName().str()));
+    struct Target { GlobalVariable *G; uint8_t key; uint64_t len; };
+    std::vector<Target> targets;
+
+    for (GlobalVariable &G : M.globals()) {
+      if (!G.hasInitializer() || !G.isConstant())
+        continue;
+      if (!(G.hasPrivateLinkage() || G.hasInternalLinkage()))
+        continue;
+      auto *CDA = dyn_cast<ConstantDataArray>(G.getInitializer());
+      if (!CDA || !CDA->getElementType()->isIntegerTy(8))
+        continue;
+      // Skip strings referenced from other constants (making them writable is unsafe there).
+      bool unsafe = false;
+      for (User *U : G.users())
+        if (isa<Constant>(U) && !isa<GlobalValue>(U)) { unsafe = true; break; }
+      if (unsafe)
+        continue;
+      StringRef data = CDA->getRawDataValues();
+      if (data.size() < 2 || data.size() > (1u << 16))
+        continue;
+
+      uint8_t key = (uint8_t)(rng() | 1u);
+      std::vector<uint8_t> enc(data.begin(), data.end());
+      for (size_t i = 0; i < enc.size(); i++)
+        enc[i] ^= (uint8_t)(key + i);
+      G.setInitializer(ConstantDataArray::get(Ctx, enc));
+      G.setConstant(false);
+      targets.push_back({&G, key, enc.size()});
+    }
+    if (targets.empty())
+      return PreservedAnalyses::all();
+
+    // A constructor that decrypts every target in place before main.
+    Function *Helper = getXorHelper(M);
+    FunctionType *FT = FunctionType::get(Type::getVoidTy(Ctx), false);
+    Function *Ctor =
+        Function::Create(FT, GlobalValue::InternalLinkage, "rustcloak.decrypt", M);
+    BasicBlock *BB = BasicBlock::Create(Ctx, "entry", Ctor);
+    IRBuilder<> B(BB);
+    Type *I8 = Type::getInt8Ty(Ctx), *I64 = Type::getInt64Ty(Ctx);
+    for (auto &T : targets) {
+      Value *P = B.CreateBitCast(T.G, PointerType::getUnqual(Ctx));
+      B.CreateCall(Helper, {P, ConstantInt::get(I64, T.len),
+                            ConstantInt::get(I8, T.key)});
+    }
+    B.CreateRetVoid();
+    appendToGlobalCtors(M, Ctor, 0);
+    return PreservedAnalyses::none();
+  }
+  static bool isRequired() { return true; }
+};
+
 } // namespace
 
 llvm::PassPluginLibraryInfo getRustCloakPluginInfo() {
   return {LLVM_PLUGIN_API_VERSION, "RustCloak", "0.1",
           [](PassBuilder &PB) {
+            // explicit: `-passes=flatten` (function) and `-passes=strenc` (module)
             PB.registerPipelineParsingCallback(
                 [](StringRef Name, FunctionPassManager &FPM,
                    ArrayRef<PassBuilder::PipelineElement>) {
@@ -195,6 +307,25 @@ llvm::PassPluginLibraryInfo getRustCloakPluginInfo() {
                     return true;
                   }
                   return false;
+                });
+            PB.registerPipelineParsingCallback(
+                [](StringRef Name, ModulePassManager &MPM,
+                   ArrayRef<PassBuilder::PipelineElement>) {
+                  if (Name == "strenc") {
+                    MPM.addPass(StrEncPass());
+                    return true;
+                  }
+                  return false;
+                });
+            // Loading the plugin into a default -O pipeline (clang/opt -O2 -fpass-plugin=...)
+            // obfuscates at the END of the pipeline, so the optimizer's own passes cannot undo
+            // the flattening. Set RUSTCLOAK_OFF to disable this automatic insertion.
+            PB.registerOptimizerLastEPCallback(
+                [](ModulePassManager &MPM, OptimizationLevel) {
+                  if (getenv("RUSTCLOAK_OFF"))
+                    return;
+                  MPM.addPass(StrEncPass());
+                  MPM.addPass(createModuleToFunctionPassAdaptor(FlattenPass()));
                 });
           }};
 }
