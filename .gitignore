@@ -1,0 +1,5 @@
+build/
+*.ll
+*.o
+*.so
+demo_*
