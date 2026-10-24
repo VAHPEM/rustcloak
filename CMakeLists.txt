@@ -12,7 +12,13 @@ separate_arguments(LLVM_DEFINITIONS_LIST NATIVE_COMMAND "${LLVM_DEFINITIONS}")
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-add_library(RustCloak MODULE src/Flatten.cpp)
+add_library(RustCloak MODULE
+  src/Flatten.cpp
+  src/StrEnc.cpp
+  src/Subst.cpp
+  src/Bogus.cpp
+  src/Plugin.cpp)
+target_include_directories(RustCloak PRIVATE src)
 # LLVM is normally built without RTTI; match it or the plugin fails to load.
 target_compile_options(RustCloak PRIVATE -fno-rtti -Wall)
 set_target_properties(RustCloak PROPERTIES PREFIX "lib")
