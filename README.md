@@ -83,14 +83,17 @@ Each transform lives in its own source file and can be used alone or together.
    the original program. Because `virt` runs *first* in the pipeline, its interpreter is then itself
    substituted, given bogus flow and flattened — the protections compound. Enabled with
    **`RUSTCLOAK_VM=1`**.
-   *Scope (grows per round; correctness over coverage):* integer functions returning `i32`/`i64`.
-   Round 1 did single-basic-block bodies; **round 2 adds control flow** — multi-block functions
-   with branches and **loops** (and the PHI nodes they create), via `JMP`/`JZ`/`JNZ` opcodes and
-   SSA-destruction (critical-edge split + read-all-then-write copies on predecessors). So an
-   iterative scalar routine (a CRC/hash loop with an in-loop branch) now virtualizes whole. Still
-   integer-only: **memory** (load/store) and **calls** are the next rounds; a function using them is
-   left native. Verified behaviour-identical to native on x86-64 and AArch64 over a 20k-input stress
-   fold (per-function and whole-program).
+   *Scope (grows per round; correctness over coverage):* Round 1 single-basic-block integer
+   functions; **round 2** control flow (multi-block, branches, **loops**, PHI nodes) via
+   `JMP`/`JZ`/`JNZ` and SSA-destruction; **round 3** memory — loads, stores, `getelementptr`,
+   pointers, mixed widths (i8/i16/i32/i64), so a real buffer routine virtualizes whole; **round 4
+   hardens the VM itself** — the logical-opcode→byte map is a **seeded random permutation per build
+   and per function**, so two builds share no VM instruction set and a deobfuscator cannot assume
+   fixed opcode numbers (it must recover the map from the handlers). Each width-sensitive opcode
+   still carries its width in its two high bits; the bytecode and pool are mutable globals read
+   through volatile loads. Left native: **calls**, globals, floats, vectors. Verified
+   behaviour-identical to native on x86-64 and AArch64 over a 20,000-iteration stress fold through
+   real buffers, across seeds (each a different opcode map).
 
 **Per-build randomness.** All state numbers and keys come from a build seed. By default the seed is
 random per build, so two builds of the same program differ (no two copies look alike); pass
