@@ -38,7 +38,10 @@
 #include "llvm/IR/Module.h"
 #include "llvm/Transforms/Utils/BasicBlockUtils.h"
 
+#include <algorithm>
+#include <array>
 #include <cstdlib>
+#include <numeric>
 #include <vector>
 
 using namespace llvm;
@@ -179,6 +182,14 @@ PreservedAnalyses VirtPass::run(Function &F, FunctionAnalysisManager &) {
   if (!eligible(F))
     return PreservedAnalyses::all();
 
+  // Per-build, per-function opcode encoding: the logical opcode -> byte mapping is a seeded random
+  // permutation of the low 6 bits, so two builds (or two functions) share no VM instruction set and
+  // a deobfuscator cannot assume fixed opcode numbers -- it must recover the map from the handlers.
+  // The width still rides in the top two bits.
+  std::array<uint8_t, 64> enc;           // enc[logical base] = emitted byte-base
+  std::iota(enc.begin(), enc.end(), 0);
+  std::shuffle(enc.begin(), enc.end(), rustcloak::rng(("vmenc:" + F.getName()).str()));
+
   SplitAllCriticalEdges(F);              // so PHI copies can live at predecessors
 
   Module &M = *F.getParent();
@@ -244,7 +255,7 @@ PreservedAnalyses VirtPass::run(Function &F, FunctionAnalysisManager &) {
   std::vector<VI> code;
   auto emit = [&](uint8_t base, unsigned width, unsigned dst, unsigned a, unsigned b,
                   BasicBlock *tgt = nullptr) {
-    code.push_back(VI{(uint8_t)(base | (wcodeOf(width) << 6)), (uint8_t)dst,
+    code.push_back(VI{(uint8_t)(enc[base] | (wcodeOf(width) << 6)), (uint8_t)dst,
                       (uint8_t)a, (uint8_t)b, tgt});
   };
   for (auto &kv : P.creg)
@@ -444,9 +455,12 @@ PreservedAnalyses VirtPass::run(Function &F, FunctionAnalysisManager &) {
     B.CreateBr(loop);
   };
 
+  std::array<uint8_t, 64> dec;           // invert the opcode encoding for handler generation
+  for (unsigned i = 0; i < 64; i++)
+    dec[enc[i]] = (uint8_t)i;
   static const unsigned WBITS[4] = {8, 16, 32, 64};
   for (unsigned ob : present) {
-    uint8_t base = ob & 0x3f;
+    uint8_t base = dec[ob & 0x3f];
     unsigned wbits = WBITS[(ob >> 6) & 3];
     Type *iW = IntegerType::get(Ctx, wbits);
     BasicBlock *h = BasicBlock::Create(Ctx, "", &F, bad);
