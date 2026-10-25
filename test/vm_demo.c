@@ -29,9 +29,35 @@ uint64_t fold64(uint64_t h, uint64_t v) {
     return h + (v & 0xffull);
 }
 
-int main(void) {
+// a scalar LOOP with an in-loop branch (no memory) -- exercises control-flow virtualization
+__attribute__((noinline))
+uint32_t crc_ish(uint32_t x, uint32_t n) {
+    uint32_t h = 0x811c9dc5u;
+    for (uint32_t i = 0; i < n; i++) {
+        h ^= (x + i);
+        h *= 16777619u;
+        if (h & 1u)
+            h ^= 0x5bd1e995u;
+    }
+    return h;
+}
+
+int main(int argc, char **argv) {
+    if (argc > 1) {                       // stress mode: fold many inputs into one checksum
+        unsigned long long acc = 0;
+        for (unsigned i = 0; i < 20000; i++) {
+            unsigned x = i * 2654435761u, y = (i ^ 0x5a5a5a5au) + 7;
+            acc ^= mix(x, y);
+            acc = acc * 31 + (unsigned)check((int)x, (int)y);
+            acc ^= fold64(acc, (unsigned long long)x << 13 | y);
+            acc += crc_ish(x, i % 200);
+        }
+        printf("stress=%llu\n", acc);
+        return 0;
+    }
     printf("mix=%u\n", mix(0xdeadbeefu, 0x12345678u));
     printf("check=%d\n", check(1234567, 42));
     printf("fold64=%llu\n", (unsigned long long)fold64(0xcbf29ce484222325ull, 0x61626364ull));
+    printf("crc_ish=%u\n", crc_ish(0xcafef00du, 50));
     return 0;
 }

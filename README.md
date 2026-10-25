@@ -83,11 +83,14 @@ Each transform lives in its own source file and can be used alone or together.
    the original program. Because `virt` runs *first* in the pipeline, its interpreter is then itself
    substituted, given bogus flow and flattened — the protections compound. Enabled with
    **`RUSTCLOAK_VM=1`**.
-   *Round-1 scope (expanded in later rounds):* single-basic-block integer functions returning
-   `i32`/`i64` — the integer mixers, key schedules and branchless checks that matter — using
-   arithmetic, comparisons, `select` and the `i1`↔`iW` casts comparisons feed. Anything with memory,
-   calls, loops/branches or other types is left native (correctness over coverage). Later rounds add
-   branch opcodes (control flow), load/store opcodes (memory) and call opcodes.
+   *Scope (grows per round; correctness over coverage):* integer functions returning `i32`/`i64`.
+   Round 1 did single-basic-block bodies; **round 2 adds control flow** — multi-block functions
+   with branches and **loops** (and the PHI nodes they create), via `JMP`/`JZ`/`JNZ` opcodes and
+   SSA-destruction (critical-edge split + read-all-then-write copies on predecessors). So an
+   iterative scalar routine (a CRC/hash loop with an in-loop branch) now virtualizes whole. Still
+   integer-only: **memory** (load/store) and **calls** are the next rounds; a function using them is
+   left native. Verified behaviour-identical to native on x86-64 and AArch64 over a 20k-input stress
+   fold (per-function and whole-program).
 
 **Per-build randomness.** All state numbers and keys come from a build seed. By default the seed is
 random per build, so two builds of the same program differ (no two copies look alike); pass
