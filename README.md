@@ -23,7 +23,7 @@ built on LLVM, and the protection survives into the final binary.
 Technically it is an **LLVM new-pass-manager plugin**: a shared library (`libRustCloak.so`) you load
 into the compiler. It is built against stock LLVM (no LLVM fork), so it compiles in minutes.
 
-## What it does — the four transforms
+## What it does — the five transforms
 
 Each transform lives in its own source file and can be used alone or together.
 
@@ -69,6 +69,25 @@ Each transform lives in its own source file and can be used alone or together.
    so a deobfuscator cannot pattern-match a single shape: `(x·(x+1)) & 1 == 0`, `(x² + x) & 1 == 0`,
    `(x² ^ x) & 1 == 0`, `(x | 1) & 1 == 1`, and `(x&1)·(x&1) == (x&1)`. Each guarded block gains a
    fake alternate path that never executes but clutters the control-flow graph.
+
+5. **Code virtualization — `virt` (`src/Virt.cpp`).** The strongest transform. Instead of leaving a
+   function as native code, `virt` compiles its computation into a custom **bytecode** for a made-up
+   **register machine (machine virtuelle à registres)** and replaces the function body with a
+   **bytecode interpreter**. A reverse engineer no longer sees x86/ARM arithmetic for that function —
+   they see a dispatch loop over opcodes whose semantics they must first reconstruct, and then a
+   bytecode program they must decode. This is the technique behind VMProtect / Themida / Tigress,
+   done here at the LLVM-IR level so the interpreter LLVM compiles is portable to any target. The
+   virtual instruction set is register-based (a fixed array of iW registers, a constant pool, a
+   4-byte `[opcode, dst, a, b]` instruction); the bytecode and pool are emitted as **mutable** globals
+   read through **volatile** loads, so the optimizer cannot constant-fold the interpreter back into
+   the original program. Because `virt` runs *first* in the pipeline, its interpreter is then itself
+   substituted, given bogus flow and flattened — the protections compound. Enabled with
+   **`RUSTCLOAK_VM=1`**.
+   *Round-1 scope (expanded in later rounds):* single-basic-block integer functions returning
+   `i32`/`i64` — the integer mixers, key schedules and branchless checks that matter — using
+   arithmetic, comparisons, `select` and the `i1`↔`iW` casts comparisons feed. Anything with memory,
+   calls, loops/branches or other types is left native (correctness over coverage). Later rounds add
+   branch opcodes (control flow), load/store opcodes (memory) and call opcodes.
 
 **Per-build randomness.** All state numbers and keys come from a build seed. By default the seed is
 random per build, so two builds of the same program differ (no two copies look alike); pass
@@ -124,6 +143,7 @@ opt-18 -load-pass-plugin=build/libRustCloak.so -passes='strenc,function(subst,bo
 #   RUSTCLOAK_SEED=N     reproducible build (default: random per build)
 #   RUSTCLOAK_LAZY=1     decrypt each string on first use, not all at startup
 #   RUSTCLOAK_ANTIEMU=1  bind string keys to a loader-set marker (defeats isolated emulation)
+#   RUSTCLOAK_VM=1       virtualize eligible functions into custom-bytecode + interpreter
 #   RUSTCLOAK_OFF=1      disable all transforms (safety off-switch; emit a normal build)
 ```
 
@@ -172,6 +192,10 @@ to the second:
   now implemented — see `RUSTCLOAK_ANTIEMU` and transform 3.)
 - Stronger anti-analysis state no constructor sets: keys derived at the first real syscall, or
   timing/TSC gates — the next step beyond what constructor-replay can answer.
+- **Code virtualization — multi-round build-out.** Round 1 (done, `RUSTCLOAK_VM=1`) virtualizes
+  single-block integer functions. Next rounds: branch opcodes (whole-CFG virtualization, loops),
+  load/store opcodes (memory), call opcodes; then multiple randomized VM dispatch shapes and a
+  bytecode whose encoding is itself per-build randomized/encrypted, so two builds share no VM.
 
 ## Layout
 

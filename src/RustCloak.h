@@ -8,6 +8,7 @@
 //   strenc   (StrEnc.cpp)   string-literal encryption -- no plaintext in the file
 //   subst    (Subst.cpp)    instruction substitution  -- rewrite arithmetic/logic
 //   bogus    (Bogus.cpp)    bogus control flow + opaque predicates -- fake branches
+//   virt     (Virt.cpp)     code virtualization       -- bytecode + interpreter (RUSTCLOAK_VM=1)
 //
 // Plugin.cpp registers them: explicitly by name (`-passes=...`) and automatically
 // at the end of a default -O pipeline (`clang -O2 -fpass-plugin=...`) so the
@@ -84,6 +85,10 @@ struct SubstPass : llvm::PassInfoMixin<SubstPass> {
   static bool isRequired() { return true; }
 };
 struct BogusPass : llvm::PassInfoMixin<BogusPass> {
+  llvm::PreservedAnalyses run(llvm::Function &F, llvm::FunctionAnalysisManager &);
+  static bool isRequired() { return true; }
+};
+struct VirtPass : llvm::PassInfoMixin<VirtPass> {
   llvm::PreservedAnalyses run(llvm::Function &F, llvm::FunctionAnalysisManager &);
   static bool isRequired() { return true; }
 };

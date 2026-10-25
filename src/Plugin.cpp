@@ -12,8 +12,10 @@ using namespace llvm;
 // command-line option is registered, so the plugin pulls in no `llvm::cl::` symbols and loads
 // cleanly into any host LLVM of the matching major version, rustc's -Zllvm-plugins included.
 
-// Add the per-function transforms in order: substitute, add bogus flow, then flatten.
+// Add the per-function transforms in order: virtualize first (so the interpreter it emits is then
+// itself substituted, given bogus flow and flattened), then substitute, add bogus flow, flatten.
 static void addFunctionTransforms(FunctionPassManager &FPM) {
+  FPM.addPass(VirtPass());
   FPM.addPass(SubstPass());
   FPM.addPass(BogusPass());
   FPM.addPass(FlattenPass());
@@ -29,6 +31,7 @@ llvm::PassPluginLibraryInfo getRustCloakPluginInfo() {
                   if (Name == "flatten") { FPM.addPass(FlattenPass()); return true; }
                   if (Name == "subst")   { FPM.addPass(SubstPass());   return true; }
                   if (Name == "bogus")   { FPM.addPass(BogusPass());   return true; }
+                  if (Name == "virt")    { FPM.addPass(VirtPass());    return true; }
                   return false;
                 });
             PB.registerPipelineParsingCallback(
