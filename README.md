@@ -53,7 +53,8 @@ Each transform lives in its own source file and can be used alone or together.
 
 **Per-build randomness.** All state numbers and keys come from a build seed. By default the seed is
 random per build, so two builds of the same program differ (no two copies look alike); pass
-`--rustcloak-seed=N` for a reproducible build.
+`RUSTCLOAK_SEED=N` (an environment variable, so it works through `clang` and `rustc` alike) for a
+reproducible build.
 
 **Late ordering.** When loaded into a normal `-O2` pipeline, the transforms run at `OptimizerLast` —
 *after* the optimizer — so the optimizer's own passes cannot simplify the obfuscation away.
@@ -120,10 +121,23 @@ recovered end-to-end by rust-deobf's deflattener on both arches — the red/blue
 
 ## Rust integration notes
 
-`-Zllvm-plugins` is a **nightly** flag, and the plugin must be built against the **same LLVM major
-version `rustc` ships** (rustc 1.81 / nightly-2024-06 use LLVM 18, matching `llvm-18-dev`; current
-stable rustc uses a newer LLVM, so build the plugin against that LLVM to target it). On stable, or to
-obfuscate only part of a crate, use the explicit IR path (`rustc --emit=llvm-ir` → `opt` → relink).
+There are two ways to apply RustCloak to Rust, and `test/rust_demo.sh` uses the first, falling back
+to the second:
+
+1. **`rustc -Zllvm-plugins`** (convenient) — a **nightly** flag; the plugin must be built against the
+   **same LLVM major version `rustc` ships** (rustc 1.81 / nightly-2024-06 use LLVM 18, matching
+   `llvm-18-dev`). One caveat: rustc loads the plugin with `dlopen`, so the plugin's LLVM symbols
+   must resolve against rustc's **bundled** LLVM — and **rustup toolchains statically link LLVM and
+   hide most of its symbols**, so the load fails with `undefined symbol: ...` (e.g.
+   `IRBuilderDefaultInserter`). This is a property of how that `rustc` was built, not of the
+   architecture. It works with a `rustc` whose LLVM is dynamically linked / exports its symbols.
+
+2. **`opt`-on-IR** (portable, any host/arch) — `rustc --emit=llvm-ir`, then the system `opt` (the
+   same LLVM the plugin was built against) runs the passes on the real rustc IR:
+   `opt -load-pass-plugin=build/libRustCloak.so -passes='strenc,function(subst,bogus,flatten)'`.
+   This never depends on rustc's symbol exports and is the right path on stable or to obfuscate only
+   part of a crate. Verified on **x86-64 and AArch64**: the secret string disappears from the IR and
+   the flattening markers appear.
 
 ## Roadmap
 

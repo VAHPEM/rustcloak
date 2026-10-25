@@ -8,10 +8,9 @@
 
 using namespace llvm;
 
-// Build seed (see RustCloak.h). 0 = fresh random seed per build.
-llvm::cl::opt<unsigned> rustcloak::Seed(
-    "rustcloak-seed", cl::init(0),
-    cl::desc("RustCloak RNG seed; 0 = random per build"));
+// The build seed comes from the RUSTCLOAK_SEED environment variable (see RustCloak.h); no LLVM
+// command-line option is registered, so the plugin pulls in no `llvm::cl::` symbols and loads
+// cleanly into any host LLVM of the matching major version, rustc's -Zllvm-plugins included.
 
 // Add the per-function transforms in order: substitute, add bogus flow, then flatten.
 static void addFunctionTransforms(FunctionPassManager &FPM) {

@@ -18,29 +18,35 @@
 #define RUSTCLOAK_H
 
 #include "llvm/IR/PassManager.h"
-#include "llvm/Support/CommandLine.h"
 
 #include <cstdint>
+#include <cstdlib>
 #include <functional>
 #include <random>
 #include <string>
 
 namespace rustcloak {
 
-// Build seed. 0 (default) -> a fresh random seed per build, so every build differs;
-// a non-zero value gives reproducible builds. Defined in Plugin.cpp.
-extern llvm::cl::opt<unsigned> Seed;
-
-// One base seed per process (per build invocation).
+// One base seed per process (per build invocation). The seed comes from the environment variable
+// RUSTCLOAK_SEED (any strtoull-parsable value, e.g. 1 or 0x1234); unset -> a fresh random seed per
+// build, so every build differs. An env var is used rather than an LLVM `cl::opt` because command-
+// line options drag in `llvm::cl::` symbols that a host LLVM (notably the one rustc bundles for
+// -Zllvm-plugins) need not export, which stops the plugin loading; an env var is portable.
 inline uint64_t baseSeed() {
-  static uint64_t s = Seed ? (uint64_t)Seed
-                           : (((uint64_t)std::random_device{}() << 32) ^
-                              (uint64_t)std::random_device{}());
+  static uint64_t s = []() -> uint64_t {
+    if (const char *e = std::getenv("RUSTCLOAK_SEED")) {
+      char *end = nullptr;
+      unsigned long long v = std::strtoull(e, &end, 0);
+      if (end != e)
+        return (uint64_t)v;
+    }
+    return (((uint64_t)std::random_device{}() << 32) ^ (uint64_t)std::random_device{}());
+  }();
   return s;
 }
 
 // A generator derived from the build seed and a tag, so different functions/strings
-// get independent streams that are still reproducible for a fixed --rustcloak-seed.
+// get independent streams that are still reproducible for a fixed RUSTCLOAK_SEED.
 inline std::mt19937_64 rng(llvm::StringRef tag) {
   uint64_t h = std::hash<std::string>{}(tag.str()) * 0x9e3779b97f4a7c15ull;
   return std::mt19937_64(baseSeed() ^ h);
