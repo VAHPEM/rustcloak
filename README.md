@@ -89,9 +89,12 @@ Each transform lives in its own source file and can be used alone or together.
    pointers, mixed widths (i8/i16/i32/i64), so a real buffer routine virtualizes whole; **round 4
    hardens the VM itself** — the logical-opcode→byte map is a **seeded random permutation per build
    and per function**, so two builds share no VM instruction set and a deobfuscator cannot assume
-   fixed opcode numbers (it must recover the map from the handlers). Each width-sensitive opcode
-   still carries its width in its two high bits; the bytecode and pool are mutable globals read
-   through volatile loads. Left native: **calls**, globals, floats, vectors. Verified
+   fixed opcode numbers (it must recover the map from the handlers); and the three **operand bytes
+   (dst, a, b) are XOR-encrypted** with a per-build/per-function key, so the *whole* 4-byte
+   instruction — register indices, pool indices and branch targets included — is build-specific and
+   the interpreter decrypts each operand after fetch. Each width-sensitive opcode still carries its
+   width in its two high bits; the bytecode and pool are mutable globals read through volatile loads.
+   Left native: **calls**, globals, floats, vectors. Verified
    behaviour-identical to native on x86-64 and AArch64 over a 20,000-iteration stress fold through
    real buffers, across seeds (each a different opcode map).
 

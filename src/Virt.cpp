@@ -189,6 +189,11 @@ PreservedAnalyses VirtPass::run(Function &F, FunctionAnalysisManager &) {
   std::array<uint8_t, 64> enc;           // enc[logical base] = emitted byte-base
   std::iota(enc.begin(), enc.end(), 0);
   std::shuffle(enc.begin(), enc.end(), rustcloak::rng(("vmenc:" + F.getName()).str()));
+  // the three operand bytes (dst, a, b) are XOR-encrypted with a per-build/per-function key, so the
+  // whole 4-byte instruction -- not just the opcode -- is build-specific; the interpreter decrypts
+  // each operand after fetch. (Register indices, pool indices and branch targets are all hidden.)
+  std::mt19937_64 kg = rustcloak::rng(("vmkey:" + F.getName()).str());
+  uint8_t kd = kg() & 0xff, ka = kg() & 0xff, kb = kg() & 0xff;
 
   SplitAllCriticalEdges(F);              // so PHI copies can live at predecessors
 
@@ -379,7 +384,7 @@ PreservedAnalyses VirtPass::run(Function &F, FunctionAnalysisManager &) {
       a = off & 0xff;
       b = (off >> 8) & 0xff;
     }
-    bytes.insert(bytes.end(), {vi.op, vi.dst, a, b});
+    bytes.insert(bytes.end(), {vi.op, (uint8_t)(vi.dst ^ kd), (uint8_t)(a ^ ka), (uint8_t)(b ^ kb)});
   }
 
   // ---- globals -------------------------------------------------------------
@@ -431,10 +436,10 @@ PreservedAnalyses VirtPass::run(Function &F, FunctionAnalysisManager &) {
     l->setVolatile(true);
     return l;
   };
-  Value *opByte = bcByte(pc);
-  Value *dst = B.CreateZExt(bcByte(B.CreateAdd(pc, B.getInt64(1))), i64);
-  Value *ra = B.CreateZExt(bcByte(B.CreateAdd(pc, B.getInt64(2))), i64);
-  Value *rb = B.CreateZExt(bcByte(B.CreateAdd(pc, B.getInt64(3))), i64);
+  Value *opByte = bcByte(pc);          // opcode is permuted, not XOR-encrypted
+  Value *dst = B.CreateXor(B.CreateZExt(bcByte(B.CreateAdd(pc, B.getInt64(1))), i64), B.getInt64(kd));
+  Value *ra = B.CreateXor(B.CreateZExt(bcByte(B.CreateAdd(pc, B.getInt64(2))), i64), B.getInt64(ka));
+  Value *rb = B.CreateXor(B.CreateZExt(bcByte(B.CreateAdd(pc, B.getInt64(3))), i64), B.getInt64(kb));
   Value *pc4 = B.CreateAdd(pc, B.getInt64(4));
   Value *tgt = B.CreateOr(ra, B.CreateShl(rb, 8));
   auto loadReg = [&](Value *idx) { return B.CreateLoad(i64, regGEP(idx)); };
