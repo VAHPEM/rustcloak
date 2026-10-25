@@ -42,15 +42,58 @@ uint32_t crc_ish(uint32_t x, uint32_t n) {
     return h;
 }
 
+// a real buffer routine: XOR-decode ct[] into out[] with a 4-byte key -- loads, stores,
+// pointer indexing, mixed widths (i8 bytes, i32 index). All pointers are arguments (no globals).
+__attribute__((noinline))
+void decode(unsigned char *out, const unsigned char *ct, int len, const unsigned char *key) {
+    for (int i = 0; i < len; i++)
+        out[i] = (unsigned char)(ct[i] ^ key[i & 3]);
+}
+
+// a scalar accumulator that READS a buffer and returns a value (load + loop + arithmetic)
+__attribute__((noinline))
+uint32_t sum_mix(const uint32_t *p, int n) {
+    uint32_t h = 2166136261u;
+    for (int i = 0; i < n; i++) {
+        h = (h ^ p[i]) * 16777619u;
+        h ^= h >> 15;
+    }
+    return h;
+}
+
+// a STORE-heavy routine with a loop-carried dependency (so it won't auto-vectorize): a running
+// rolling-xor written byte by byte into out[]. Exercises LOAD + STORE + GEP in the VM.
+__attribute__((noinline))
+void roll(unsigned char *out, const unsigned char *in, int n) {
+    unsigned char acc = 0x3b;
+    for (int i = 0; i < n; i++) {
+        acc = (unsigned char)(acc * 31 + in[i]);   // loop-carried: no vectorization, no intrinsic
+        out[i] = acc;
+    }
+}
+
 int main(int argc, char **argv) {
     if (argc > 1) {                       // stress mode: fold many inputs into one checksum
         unsigned long long acc = 0;
+        unsigned char buf[256], out[256];
+        unsigned key[1] = {0};
+        unsigned char *kb = (unsigned char *)key;
         for (unsigned i = 0; i < 20000; i++) {
             unsigned x = i * 2654435761u, y = (i ^ 0x5a5a5a5au) + 7;
             acc ^= mix(x, y);
             acc = acc * 31 + (unsigned)check((int)x, (int)y);
             acc ^= fold64(acc, (unsigned long long)x << 13 | y);
             acc += crc_ish(x, i % 200);
+            // memory path: fill a buffer, decode it, read it back
+            int n = (i % 200) + 1;
+            for (int j = 0; j < n; j++) buf[j] = (unsigned char)(x >> (j & 7)) + j;
+            key[0] = x ^ y;
+            decode(out, buf, n, kb);
+            acc ^= sum_mix((const uint32_t *)out, n / 4);
+            for (int j = 0; j < n; j++) acc += out[j];
+            unsigned char rolled[256];
+            roll(rolled, out, n);         // STORE path (virtualized)
+            for (int j = 0; j < n; j++) acc = acc * 65599 + rolled[j];
         }
         printf("stress=%llu\n", acc);
         return 0;
