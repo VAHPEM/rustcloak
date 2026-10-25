@@ -70,7 +70,14 @@ baked into the binary by the normal backend.
 Flattening has one correctness subtlety worth knowing: rewiring the control flow breaks LLVM's SSA
 form (a value defined in one block and used in another is no longer guaranteed to be *dominated* by
 its definition once blocks are reached through a dispatcher). RustCloak handles this by first
-demoting such values — and all PHI nodes — to stack slots, so the rewrite is always safe.
+demoting such values — and all PHI nodes — to stack slots, and by hoisting every alloca into the
+entry block, which dominates all cases (rustc places some allocas in non-entry blocks, and
+`llvm.lifetime.end` then references one across blocks); the rewrite is always safe.
+
+RustCloak is **architecture-independent** because it transforms LLVM IR, not machine code: the same
+pass hardens x86-64 and AArch64 (and any LLVM target). The two emit different dispatcher machine
+code — x86-64 a `sub imm; je` ladder, AArch64 a `cmp wREG; b.eq` compare-tree — but that is the
+backend's choice; the IR transform is one implementation.
 
 ## Build
 
@@ -101,9 +108,15 @@ Self-checks (behaviour preserved + obfuscation present):
 RUSTCLOAK_NIGHTLY=nightly-2024-06-15 ./test/rust_demo.sh   # Rust: -Zllvm-plugins end to end
 ```
 
-Verified: on both the C and Rust demos the obfuscated binary produces identical output, the secret
-string is absent from the file, and the control flow is flattened. The flattened output is also
-recovered end-to-end by rust-deobf's deflattener — the red/blue loop.
+Both scripts are architecture-agnostic (set `RUSTCLOAK_TARGET=<triple>`, e.g. `aarch64-linux-gnu`,
+to cross-compile instead of building natively). Correctness is checked at the IR level — markers
+the pass injects, which survive `-O2`, and `strings` — not by a disassembly pattern, because the
+dispatcher's machine code differs by arch.
+
+Verified on **x86-64 and AArch64**: on the C and Rust demos the obfuscated binary produces
+identical output, the secret string is absent from the file, and the control flow is flattened
+(the dispatcher gives every block a random 32-bit state constant). The flattened output is also
+recovered end-to-end by rust-deobf's deflattener on both arches — the red/blue loop.
 
 ## Rust integration notes
 

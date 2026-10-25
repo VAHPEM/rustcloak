@@ -36,8 +36,35 @@ bool eligible(Function &F) {
       return false;
     if (BB.isLandingPad() || BB.isEHPad())
       return false;
+    // A dynamic (variable-size) alloca outside the entry block cannot be hoisted to entry
+    // without changing semantics, and left in place it will not dominate its uses once the
+    // CFG runs through the dispatcher. Such functions are left untouched.
+    if (&BB != &F.getEntryBlock())
+      for (Instruction &I : BB)
+        if (auto *AI = dyn_cast<AllocaInst>(&I))
+          if (!AI->isStaticAlloca())
+            return false;
   }
   return true;
+}
+
+// Hoist every static alloca into the entry block. Once control flow is routed through the
+// dispatcher, the entry block dominates every case, but an alloca left in a non-entry block
+// does not dominate its uses (rustc/LLVM do place allocas outside entry, and llvm.lifetime.end
+// then references one across blocks) -- which breaks SSA. Hoisting fixes that generally.
+void hoistAllocas(Function &F) {
+  BasicBlock &E = F.getEntryBlock();
+  Instruction *ip = &*E.getFirstInsertionPt();
+  std::vector<AllocaInst *> movers;
+  for (BasicBlock &BB : F) {
+    if (&BB == &E)
+      continue;
+    for (Instruction &I : BB)
+      if (auto *AI = dyn_cast<AllocaInst>(&I))
+        movers.push_back(AI);
+  }
+  for (AllocaInst *AI : movers)
+    AI->moveBefore(ip);
 }
 
 // Demote PHIs and any value used outside its block to stack (reg2mem).
@@ -69,6 +96,7 @@ void lowerToMemory(Function &F) {
 bool flatten(Function &F, std::mt19937_64 &rng) {
   if (!eligible(F))
     return false;
+  hoistAllocas(F);
   LLVMContext &Ctx = F.getContext();
   IntegerType *I32 = Type::getInt32Ty(Ctx);
 
