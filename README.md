@@ -46,6 +46,16 @@ Each transform lives in its own source file and can be used alone or together.
    uses it cannot safely redirect; the flag check is not yet thread-synchronised.) Handles both C's
    `[N x i8]` strings and Rust's wrapped `<{ [N x i8] }>` form.
 
+   With **`RUSTCLOAK_ANTIEMU=1`** the decryption keys are additionally bound to loader-established
+   state, to defeat emulation-based recovery. A marker byte starts at 0; a constructor emitted at
+   priority 0 — so it runs *before* the decrypt constructor — stores a per-build random `MAGIC` into
+   it, and every key is emitted as `key ^ MAGIC ^ load(marker)` with the marker read **volatile** so
+   the compiler cannot fold it away. On a real run the marker holds `MAGIC`, the two cancel, and the
+   real key is used — output is byte-identical to a normal build. But a tool that emulates functions
+   in isolation never runs the constructor: the marker stays 0, every key is off by `MAGIC`, and
+   nothing decodes. (Combines with lazy or eager mode. Countered in turn by an analyzer that replays
+   global constructors first — see the red/blue notes — which is the point: it raises the floor.)
+
 3. **Instruction substitution — `subst` (`src/Subst.cpp`).** Replaces arithmetic/logic with
    **mixed boolean-arithmetic (MBA)** expressions, each proven equivalent for all inputs with z3 —
    `a + b` → `(a ^ b) + 2·(a & b)`, `a - b` → `(a ^ b) − 2·(~a & b)`, `a ^ b` → `(a | b) − (a & b)`,
@@ -109,6 +119,12 @@ rustc +nightly-2024-06-15 -O -Zllvm-plugins=$PWD/build/libRustCloak.so prog.rs -
 
 # A single transform on IR, explicitly:
 opt-18 -load-pass-plugin=build/libRustCloak.so -passes='strenc,function(subst,bogus,flatten)' in.ll -S -o out.ll
+
+# Build-time flags (environment variables, so they work through clang and rustc alike):
+#   RUSTCLOAK_SEED=N     reproducible build (default: random per build)
+#   RUSTCLOAK_LAZY=1     decrypt each string on first use, not all at startup
+#   RUSTCLOAK_ANTIEMU=1  bind string keys to a loader-set marker (defeats isolated emulation)
+#   RUSTCLOAK_OFF=1      disable all transforms (safety off-switch; emit a normal build)
 ```
 
 Self-checks (behaviour preserved + obfuscation present):
@@ -152,7 +168,10 @@ to the second:
 
 - More opaque-predicate families and junk-code generators; protect the decrypt constructor itself.
 - A `cargo` wrapper so a build is just `cargo rustcloak build`.
-- Anti-debug / anti-tamper checks; MBA (mixed boolean-arithmetic) substitution.
+- Anti-debug / anti-tamper checks. (Anti-emulation via loader-bound keys and MBA substitution are
+  now implemented — see `RUSTCLOAK_ANTIEMU` and transform 3.)
+- Stronger anti-analysis state no constructor sets: keys derived at the first real syscall, or
+  timing/TSC gates — the next step beyond what constructor-replay can answer.
 
 ## Layout
 

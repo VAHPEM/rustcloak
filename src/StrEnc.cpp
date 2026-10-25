@@ -65,19 +65,50 @@ Function *getXorHelper(Module &M) {
   return F;
 }
 
+// Anti-emulation (RUSTCLOAK_ANTIEMU). A static deobfuscator that recovers strings by emulating the
+// decrypt function IN ISOLATION (as rust-deobf's engine does) never runs the program's global
+// constructors first. So we key the decryption on a marker global that a *separate* constructor
+// sets to `magic` before main: at real runtime marker==magic and the key is correct, but under
+// isolated emulation the marker constructor did not run, marker is still 0, and the key is wrong --
+// the emulated plaintext is garbage. (The blue counter is to initialise the environment -- run the
+// constructors -- before emulating, which this is designed to force.)
+struct AntiEmu { llvm::GlobalVariable *marker; uint8_t magic; };
+
+// The i8 key to hand the xor helper: a plain constant, or -- under anti-emulation -- a value that
+// XOR-cancels to the real key only when the marker holds `magic`.
+Value *keyValue(IRBuilder<> &B, LLVMContext &Ctx, uint8_t key, const AntiEmu *ae) {
+  Type *I8 = Type::getInt8Ty(Ctx);
+  if (!ae)
+    return ConstantInt::get(I8, key);
+  LoadInst *m = B.CreateLoad(I8, ae->marker);
+  m->setVolatile(true);                                  // keep the optimizer from folding it away
+  return B.CreateXor(ConstantInt::get(I8, (uint8_t)(key ^ ae->magic)), m);
+}
+
+// A constructor (run before the decryptor and before main) that stores `magic` into the marker.
+void emitMarkerCtor(Module &M, const AntiEmu &ae) {
+  LLVMContext &Ctx = M.getContext();
+  Function *C = Function::Create(FunctionType::get(Type::getVoidTy(Ctx), false),
+                                 GlobalValue::InternalLinkage, rustcloak::anon("mk"), M);
+  IRBuilder<> B(BasicBlock::Create(Ctx, "entry", C));
+  B.CreateStore(ConstantInt::get(Type::getInt8Ty(Ctx), ae.magic), ae.marker)->setVolatile(true);
+  B.CreateRetVoid();
+  appendToGlobalCtors(M, C, 0);                          // priority 0: runs before the decryptor (1)
+}
+
 // Eager mode: one global constructor that decrypts all the given strings before main().
-void emitStartupCtor(Module &M, Function *Helper, ArrayRef<EncTarget> targets) {
+void emitStartupCtor(Module &M, Function *Helper, ArrayRef<EncTarget> targets, const AntiEmu *ae) {
   LLVMContext &Ctx = M.getContext();
   FunctionType *FT = FunctionType::get(Type::getVoidTy(Ctx), false);
   Function *Ctor = Function::Create(FT, GlobalValue::InternalLinkage, rustcloak::anon("dctor"), M);
   IRBuilder<> B(BasicBlock::Create(Ctx, "entry", Ctor));
-  Type *I8 = Type::getInt8Ty(Ctx), *I64 = Type::getInt64Ty(Ctx);
+  Type *I64 = Type::getInt64Ty(Ctx);
   for (auto &T : targets) {
     Value *P = B.CreateBitCast(T.G, PointerType::getUnqual(Ctx));
-    B.CreateCall(Helper, {P, ConstantInt::get(I64, T.len), ConstantInt::get(I8, T.key)});
+    B.CreateCall(Helper, {P, ConstantInt::get(I64, T.len), keyValue(B, Ctx, T.key, ae)});
   }
   B.CreateRetVoid();
-  appendToGlobalCtors(M, Ctor, 0);
+  appendToGlobalCtors(M, Ctor, ae ? 1 : 0);              // after the marker ctor when anti-emu is on
 }
 
 // Lazy mode (RUSTCLOAK_LAZY): give one encrypted global its own getter that decrypts it on first
@@ -114,7 +145,7 @@ void expandConstantUsers(GlobalVariable *G) {
   }
 }
 
-bool makeLazy(Module &M, Function *Helper, const EncTarget &T) {
+bool makeLazy(Module &M, Function *Helper, const EncTarget &T, const AntiEmu *ae) {
   LLVMContext &Ctx = M.getContext();
   Type *I1 = Type::getInt1Ty(Ctx), *I8 = Type::getInt8Ty(Ctx), *I64 = Type::getInt64Ty(Ctx);
   Type *Ptr = PointerType::getUnqual(Ctx);
@@ -140,7 +171,7 @@ bool makeLazy(Module &M, Function *Helper, const EncTarget &T) {
   IRBuilder<> B(entry);
   B.CreateCondBr(B.CreateLoad(I1, Flag), done, dec);
   B.SetInsertPoint(dec);
-  B.CreateCall(Helper, {G, ConstantInt::get(I64, T.len), ConstantInt::get(I8, T.key)});
+  B.CreateCall(Helper, {G, ConstantInt::get(I64, T.len), keyValue(B, Ctx, T.key, ae)});
   B.CreateStore(ConstantInt::getTrue(Ctx), Flag);
   B.CreateBr(done);
   B.SetInsertPoint(done);
@@ -205,18 +236,30 @@ PreservedAnalyses StrEncPass::run(Module &M, ModuleAnalysisManager &) {
     return PreservedAnalyses::all();
 
   Function *Helper = getXorHelper(M);
+  // RUSTCLOAK_ANTIEMU keys the decryption on a marker that a constructor sets before main, so a
+  // deobfuscator that emulates the decryptor in isolation (without running constructors) recovers
+  // garbage. Default off; it does not affect a real run.
+  AntiEmu ae_storage, *ae = nullptr;
+  if (std::getenv("RUSTCLOAK_ANTIEMU")) {
+    Type *I8 = Type::getInt8Ty(Ctx);
+    ae_storage.magic = (uint8_t)(gen() | 1u);
+    ae_storage.marker = new GlobalVariable(M, I8, /*isConstant=*/false, GlobalValue::InternalLinkage,
+                                           ConstantInt::get(I8, 0), rustcloak::anon("mk"));
+    emitMarkerCtor(M, ae_storage);
+    ae = &ae_storage;
+  }
   // RUSTCLOAK_LAZY turns on on-demand decryption: each string decrypts the first time it is used,
   // not at startup. Default (unset) keeps the eager startup-constructor behaviour, so the build is
   // never affected unless the mode is explicitly requested.
   if (std::getenv("RUSTCLOAK_LAZY")) {
     std::vector<EncTarget> deferred;
     for (auto &T : targets)
-      if (!makeLazy(M, Helper, T))
+      if (!makeLazy(M, Helper, T, ae))
         deferred.push_back(T);           // not lazifiable -> still encrypted, decrypted eagerly
     if (!deferred.empty())
-      emitStartupCtor(M, Helper, deferred);
+      emitStartupCtor(M, Helper, deferred, ae);
   } else {
-    emitStartupCtor(M, Helper, targets);
+    emitStartupCtor(M, Helper, targets, ae);
   }
   return PreservedAnalyses::none();
 }
