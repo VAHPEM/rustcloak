@@ -42,22 +42,25 @@ PreservedAnalyses SubstPass::run(Function &F, FunctionAnalysisManager &) {
       continue;
     IRBuilder<> B(bo);
     Value *a = bo->getOperand(0), *b = bo->getOperand(1), *r = nullptr;
+    // Mixed boolean-arithmetic (MBA) identities, each proven equivalent for all inputs with z3
+    // (deobf_expr.py). These mix arithmetic and bitwise ops so the operation is far less obvious
+    // than the earlier a-(-b) style rewrites, and resist simple pattern reversal.
     switch (bo->getOpcode()) {
-    case Instruction::Add:
-      r = B.CreateSub(a, B.CreateNeg(b));
+    case Instruction::Add:   // a + b = (a ^ b) + 2*(a & b)
+      r = B.CreateAdd(B.CreateXor(a, b), B.CreateShl(B.CreateAnd(a, b), 1));
       break;
-    case Instruction::Sub:
-      r = B.CreateAdd(a, B.CreateNeg(b));
+    case Instruction::Sub:   // a - b = (a ^ b) - 2*(~a & b)
+      r = B.CreateSub(B.CreateXor(a, b),
+                      B.CreateShl(B.CreateAnd(B.CreateNot(a), b), 1));
       break;
-    case Instruction::Xor:
-      r = B.CreateOr(B.CreateAnd(a, B.CreateNot(b)),
-                     B.CreateAnd(B.CreateNot(a), b));
+    case Instruction::Xor:   // a ^ b = (a | b) - (a & b)
+      r = B.CreateSub(B.CreateOr(a, b), B.CreateAnd(a, b));
       break;
-    case Instruction::And:
-      r = B.CreateNot(B.CreateOr(B.CreateNot(a), B.CreateNot(b)));
+    case Instruction::And:   // a & b = (a | b) - (a ^ b)
+      r = B.CreateSub(B.CreateOr(a, b), B.CreateXor(a, b));
       break;
-    case Instruction::Or:
-      r = B.CreateNot(B.CreateAnd(B.CreateNot(a), B.CreateNot(b)));
+    case Instruction::Or:    // a | b = (a & b) + (a ^ b)
+      r = B.CreateAdd(B.CreateAnd(a, b), B.CreateXor(a, b));
       break;
     default:
       continue;

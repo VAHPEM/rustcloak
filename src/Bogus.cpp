@@ -35,14 +35,36 @@ GlobalVariable *internalI32(Module &M, StringRef name) {
   return G;
 }
 
-// Build an always-true i1 that the optimizer cannot fold: (x*(x+1)) & 1 == 0.
-Value *opaqueTrue(IRBuilder<> &B, Module &M) {
+// An always-true i1 the optimizer cannot fold, computed from a non-constant global x. Several
+// families are mixed per block (chosen by the seed) so a deobfuscator cannot pattern-match one
+// shape; each is proven always-true over all 32-bit inputs (mod 2^32) with z3 -- they reduce to a
+// parity identity: x^2 == x (mod 2), x(x+1) even, x|1 odd, or b*b == b for b in {0,1}.
+Value *opaqueTrue(IRBuilder<> &B, Module &M, std::mt19937_64 &gen) {
   Type *I32 = Type::getInt32Ty(M.getContext());
   Value *x = B.CreateLoad(I32, internalI32(M, rustcloak::anon("ox")), "");
-  Value *xp1 = B.CreateAdd(x, ConstantInt::get(I32, 1));
-  Value *prod = B.CreateMul(x, xp1);
-  Value *lo = B.CreateAnd(prod, ConstantInt::get(I32, 1));
-  return B.CreateICmpEQ(lo, ConstantInt::get(I32, 0), "");
+  Constant *zero = ConstantInt::get(I32, 0), *one = ConstantInt::get(I32, 1);
+  switch (gen() % 5) {
+  case 0: {                               // (x*(x+1)) & 1 == 0
+    Value *p = B.CreateMul(x, B.CreateAdd(x, one));
+    return B.CreateICmpEQ(B.CreateAnd(p, one), zero, "");
+  }
+  case 1: {                               // (x*x + x) & 1 == 0
+    Value *p = B.CreateAdd(B.CreateMul(x, x), x);
+    return B.CreateICmpEQ(B.CreateAnd(p, one), zero, "");
+  }
+  case 2: {                               // ((x*x) ^ x) & 1 == 0
+    Value *p = B.CreateXor(B.CreateMul(x, x), x);
+    return B.CreateICmpEQ(B.CreateAnd(p, one), zero, "");
+  }
+  case 3: {                               // (x | 1) & 1 == 1
+    Value *p = B.CreateOr(x, one);
+    return B.CreateICmpEQ(B.CreateAnd(p, one), one, "");
+  }
+  default: {                              // (x&1)*(x&1) == (x&1)
+    Value *b = B.CreateAnd(x, one);
+    return B.CreateICmpEQ(B.CreateMul(b, b), b, "");
+  }
+  }
 }
 
 bool bogusBlock(BasicBlock *BB, Module &M, std::mt19937_64 &gen) {
@@ -65,7 +87,7 @@ bool bogusBlock(BasicBlock *BB, Module &M, std::mt19937_64 &gen) {
   // BB now ends in `br tail`; replace with an opaque-guarded branch to tail or bogus.
   Instruction *term = BB->getTerminator();
   IRBuilder<> B(term);
-  Value *cond = opaqueTrue(B, M);
+  Value *cond = opaqueTrue(B, M, gen);
 
   BasicBlock *bogus = BasicBlock::Create(M.getContext(), "", BB->getParent(), tail);
   IRBuilder<> BB2(bogus);
