@@ -68,19 +68,30 @@ o2_cmp=$($OBJDUMP -d --no-show-raw-insn build/demo_hard.o 2>/dev/null | sed -n '
 HARD="$ORIG"
 if [ "$RUN" = 1 ]; then $CLANG -O2 $TGT -fpass-plugin=$PLUGIN test/demo.c -o build/demo_hard; HARD=$(./build/demo_hard); fi
 
+echo "== lazy strenc (RUSTCLOAK_LAZY=1) =="
+lazy_leak=0; LAZY="$ORIG"; lazy_getters=0
+RUSTCLOAK_LAZY=1 $CLANG -O2 $VN $TGT -fpass-plugin=$PLUGIN -emit-llvm -S test/demo.c -o build/demo_lazy.ll
+lazy_getters=$(grep -cE "define internal ptr @" build/demo_lazy.ll || true)   # per-string getters
+RUSTCLOAK_LAZY=1 $CLANG -O2 $TGT -fpass-plugin=$PLUGIN -c test/demo.c -o build/demo_lazy.o
+lazy_leak=$(strings build/demo_lazy.o | grep -c "flatten-demo" || true)
+if [ "$RUN" = 1 ]; then RUSTCLOAK_LAZY=1 $CLANG -O2 $TGT -fpass-plugin=$PLUGIN test/demo.c -o build/demo_lazy; LAZY=$(./build/demo_lazy); fi
+
 echo "== results (arch=$ARCH) =="
 echo "  flatten: out='${FLAT}' markers=$markers"
 echo "  strenc : out='${ENC}' plaintext_leak=$enc_leak"
 echo "  -O2    : out='${HARD}' survived_markers=$o2_markers plaintext_leak=$o2_leak dispatcher_insns=$o2_cmp"
+echo "  lazy   : out='${LAZY}' getters=$lazy_getters plaintext_leak=$lazy_leak"
 
 ok=1
 [ "$markers" -ge 5 ] || { echo "FAIL flatten: no dispatcher switch ($markers arms)"; ok=0; }
 [ "$enc_leak" -eq 0 ] || { echo "FAIL strenc: plaintext leaked"; ok=0; }
 [ "$o2_markers" -ge 5 ] && [ "$o2_leak" -eq 0 ] || { echo "FAIL -O2: dispatcher gone ($o2_markers) / leaked"; ok=0; }
+[ "$lazy_getters" -ge 1 ] && [ "$lazy_leak" -eq 0 ] || { echo "FAIL lazy: no getters ($lazy_getters) / leaked"; ok=0; }
 if [ "$RUN" = 1 ]; then
   [ "$ORIG" = "$FLAT" ] || { echo "FAIL flatten: behaviour changed"; ok=0; }
   [ "$ORIG" = "$ENC" ]  || { echo "FAIL strenc: behaviour changed"; ok=0; }
   [ "$ORIG" = "$HARD" ] || { echo "FAIL -O2: behaviour changed"; ok=0; }
+  [ "$ORIG" = "$LAZY" ] || { echo "FAIL lazy: behaviour changed"; ok=0; }
 else
   echo "  [cross-compile to $ARCH: IR/object verified, behaviour not run]"
 fi

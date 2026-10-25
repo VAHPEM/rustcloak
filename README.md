@@ -36,20 +36,29 @@ Each transform lives in its own source file and can be used alone or together.
    implementation.)
 
 2. **String-literal encryption — `strenc` (`src/StrEnc.cpp`).** Every private constant string is
-   XOR-encrypted in the file with a per-string keystream, and a small decrypt routine is registered
-   as a *global constructor* that restores the strings in memory just before `main` runs. On disk the
-   binary holds only ciphertext — `strings` and FLOSS find nothing; the plaintext exists only while
-   the program runs. (Handles both C's `[N x i8]` strings and Rust's wrapped `<{ [N x i8] }>` form.)
+   XOR-encrypted in the file with a per-string keystream. On disk the binary holds only ciphertext —
+   `strings` and FLOSS find nothing. Two modes: by default a small decrypt routine runs as a *global
+   constructor* and restores every string just before `main`; with **`RUSTCLOAK_LAZY=1`** each string
+   instead gets its own getter that decrypts it **on first use** (guarded by a flag) and returns its
+   pointer, and every use is redirected to that getter — so the plaintext exists in memory only once
+   a string is actually touched, and only for strings a run reaches, defeating a startup memory dump
+   or a dump of an un-taken path. (Lazy mode falls back to the eager constructor for any string whose
+   uses it cannot safely redirect; the flag check is not yet thread-synchronised.) Handles both C's
+   `[N x i8]` strings and Rust's wrapped `<{ [N x i8] }>` form.
 
-3. **Instruction substitution — `subst` (`src/Subst.cpp`).** Replaces simple arithmetic/logic with
-   longer equivalent expressions, so the obvious operation is no longer obvious — e.g. `a + b` → `a -
-   (-b)`, `a ^ b` → `(a & ~b) | (~a & b)`, `a & b` → `~(~a | ~b)`.
+3. **Instruction substitution — `subst` (`src/Subst.cpp`).** Replaces arithmetic/logic with
+   **mixed boolean-arithmetic (MBA)** expressions, each proven equivalent for all inputs with z3 —
+   `a + b` → `(a ^ b) + 2·(a & b)`, `a - b` → `(a ^ b) − 2·(~a & b)`, `a ^ b` → `(a | b) − (a & b)`,
+   `a & b` → `(a | b) − (a ^ b)`, `a | b` → `(a & b) + (a ^ b)` — mixing arithmetic and bitwise ops so
+   the operation is far less obvious and resists simple pattern reversal.
 
 4. **Bogus control flow + opaque predicates — `bogus` (`src/Bogus.cpp`).** Splits blocks and guards
    the real path with an **opaque predicate** — a condition that is always true but that the compiler
-   cannot fold away, because it is computed from a non-constant global (`(x*(x+1)) & 1 == 0`, always
-   true since the product of consecutive integers is even). Each guarded block gains a fake alternate
-   path that never executes but clutters the control-flow graph a reader must reason through.
+   cannot fold away, because it is computed from a non-constant global. **Five always-true families**
+   are mixed per block (the seed picks one), each proven always-true over all 32-bit inputs with z3,
+   so a deobfuscator cannot pattern-match a single shape: `(x·(x+1)) & 1 == 0`, `(x² + x) & 1 == 0`,
+   `(x² ^ x) & 1 == 0`, `(x | 1) & 1 == 1`, and `(x&1)·(x&1) == (x&1)`. Each guarded block gains a
+   fake alternate path that never executes but clutters the control-flow graph.
 
 **Per-build randomness.** All state numbers and keys come from a build seed. By default the seed is
 random per build, so two builds of the same program differ (no two copies look alike); pass
