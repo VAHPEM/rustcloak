@@ -3,3 +3,7 @@ build/
 *.o
 *.so
 demo_*
+difffuzz
+stdfuzz
+test/fuzz/*.so
+test/fuzz/base.o
