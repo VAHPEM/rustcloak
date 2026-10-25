@@ -72,6 +72,13 @@ void roll(unsigned char *out, const unsigned char *in, int n) {
     }
 }
 
+// a non-inlined helper, and a function that CALLS it twice -- exercises call virtualization
+__attribute__((noinline))
+uint32_t helper(uint32_t a, uint32_t b) { return a * b + (a ^ b); }
+
+__attribute__((noinline))
+uint32_t wrap(uint32_t x, uint32_t y) { return helper(x, y) + helper(y, x) * 3; }
+
 int main(int argc, char **argv) {
     if (argc > 1) {                       // stress mode: fold many inputs into one checksum
         unsigned long long acc = 0;
@@ -94,6 +101,7 @@ int main(int argc, char **argv) {
             unsigned char rolled[256];
             roll(rolled, out, n);         // STORE path (virtualized)
             for (int j = 0; j < n; j++) acc = acc * 65599 + rolled[j];
+            acc ^= wrap(x, y);            // CALL path (virtualized)
         }
         printf("stress=%llu\n", acc);
         return 0;

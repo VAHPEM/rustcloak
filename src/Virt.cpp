@@ -67,6 +67,8 @@ enum Op : uint8_t {
   OP_STORE = 33,  // *(iW*)reg[a] = trunc(reg[b], iW)   (dst unused)
   OP_SEXT = 34,   // reg[dst] = sext( trunc(reg[a], iW) )  -- sign-extend from W bits to 64
   OP_RETV = 35,   // return void
+  OP_PUSHARG = 36,// argbuf[argn++] = reg[a]   (stage one call argument)
+  OP_CALL = 37,   // reg[dst] = calleetable[a](argbuf...); argn = 0   (a = callee index)
 };
 
 static uint8_t wcodeOf(unsigned bits) {
@@ -111,6 +113,23 @@ static bool isRegTy(Type *T) {
 static bool okOperand(Value *v) {
   return isa<Argument>(v) || isa<Instruction>(v) || isa<ConstantInt>(v) ||
          isa<UndefValue>(v) || isa<ConstantPointerNull>(v);
+}
+
+// A direct call we can virtualize: a known, non-vararg, non-intrinsic callee, at most 6 integer/
+// pointer arguments (all passed in registers on SysV/AAPCS, so a uniform i64(i64x6) thunk is ABI-
+// safe), returning an integer/pointer/void. Float/vector args or >6 args -> leave the function
+// native.
+static Function *virtCallee(CallInst *ci) {
+  if (ci->isInlineAsm())
+    return nullptr;
+  Function *callee = ci->getCalledFunction();
+  if (!callee || callee->isIntrinsic() || callee->isVarArg() || ci->arg_size() > 6)
+    return nullptr;
+  for (Value *a : ci->args())
+    if (!isRegTy(a->getType()))
+      return nullptr;
+  Type *rt = ci->getType();
+  return (rt->isVoidTy() || isRegTy(rt)) ? callee : nullptr;
 }
 
 static bool eligible(Function &F) {
@@ -158,14 +177,19 @@ static bool eligible(Function &F) {
              vt->isIntegerTy() && vt->getIntegerBitWidth() <= 64;
       } else if (isa<PHINode>(&I)) {
         ok = isRegTy(I.getType());
+      } else if (auto *ci = dyn_cast<CallInst>(&I)) {
+        ok = virtCallee(ci) != nullptr;
       } else if (isa<ReturnInst>(&I) || isa<BranchInst>(&I)) {
         ok = true;
       }
       if (!ok)
         return false;
+      auto *callI = dyn_cast<CallInst>(&I);
       for (Value *op : I.operands()) {
         if (isa<BasicBlock>(op))
           continue;
+        if (callI && op == callI->getCalledOperand())
+          continue;                      // the callee (a Function) is handled via the callee table
         if (!okOperand(op))
           return false;                  // globals / constexprs / float consts -> native
       }
@@ -246,7 +270,20 @@ PreservedAnalyses VirtPass::run(Function &F, FunctionAnalysisManager &) {
   for (unsigned i = 0; i < maxPhi; i++)
     P.temps.push_back(P.nreg++);
   P.gepTmp = P.nreg++;
-  if (P.nreg > 256 || P.consts.size() > 0xffff)
+  unsigned voidScratch = P.nreg++;       // reg[dst] for a call whose result is void/unused
+
+  // the callees reached by CALL opcodes, as a per-function function-pointer table
+  std::vector<Function *> callees;
+  DenseMap<Function *, unsigned> calleeIdx;
+  for (BasicBlock &BB : F)
+    for (Instruction &I : BB)
+      if (auto *ci = dyn_cast<CallInst>(&I))
+        if (Function *c = virtCallee(ci))
+          if (!calleeIdx.count(c)) {
+            calleeIdx[c] = (unsigned)callees.size();
+            callees.push_back(c);
+          }
+  if (P.nreg > 256 || P.consts.size() > 0xffff || callees.size() > 256)
     return PreservedAnalyses::all();
 
   auto regOf = [&](Value *v) -> unsigned {
@@ -355,6 +392,11 @@ PreservedAnalyses VirtPass::run(Function &F, FunctionAnalysisManager &) {
       } else if (auto *st = dyn_cast<StoreInst>(&I)) {
         emit(OP_STORE, st->getValueOperand()->getType()->getIntegerBitWidth(), 0,
              regOf(st->getPointerOperand()), regOf(st->getValueOperand()));
+      } else if (auto *ci = dyn_cast<CallInst>(&I)) {
+        for (Value *a : ci->args())          // stage each argument, then call
+          emit(OP_PUSHARG, 64, 0, regOf(a), 0);
+        unsigned rd = ci->getType()->isVoidTy() ? voidScratch : d;
+        emit(OP_CALL, 64, rd, calleeIdx[ci->getCalledFunction()], 0);
       }
     }
     Instruction *term = BB->getTerminator();
@@ -394,6 +436,15 @@ PreservedAnalyses VirtPass::run(Function &F, FunctionAnalysisManager &) {
   Constant *poolInit = ConstantDataArray::get(Ctx, ArrayRef<uint64_t>(P.consts));
   auto *pool = new GlobalVariable(M, poolInit->getType(), false, GlobalValue::InternalLinkage,
                                   poolInit, rustcloak::anon("vp"));
+  // the callee table: a function-pointer array the CALL opcode indexes
+  Type *ptrTy = PointerType::get(Ctx, 0);
+  ArrayType *ctTy = ArrayType::get(ptrTy, std::max<size_t>(callees.size(), 1));
+  GlobalVariable *calleeTable = nullptr;
+  if (!callees.empty()) {
+    std::vector<Constant *> cv(callees.begin(), callees.end());
+    calleeTable = new GlobalVariable(M, ctTy, false, GlobalValue::InternalLinkage,
+                                     ConstantArray::get(ctTy, cv), rustcloak::anon("vc"));
+  }
 
   // ---- rebuild F as the interpreter ----------------------------------------
   SmallVector<Argument *, 8> args;
@@ -416,6 +467,10 @@ PreservedAnalyses VirtPass::run(Function &F, FunctionAnalysisManager &) {
 
   IRBuilder<> B(entry);
   Value *regs = B.CreateAlloca(regsTy);
+  ArrayType *argbufTy = ArrayType::get(i64, 8);     // staged call arguments + the count
+  Value *argbuf = B.CreateAlloca(argbufTy);
+  Value *argn = B.CreateAlloca(i64);
+  B.CreateStore(B.getInt64(0), argn);
   auto regGEP = [&](Value *idx) { return B.CreateGEP(regsTy, regs, {B.getInt64(0), idx}); };
   for (unsigned i = 0; i < args.size(); i++) {
     Value *v = args[i];
@@ -487,6 +542,26 @@ PreservedAnalyses VirtPass::run(Function &F, FunctionAnalysisManager &) {
       LoadInst *l = B.CreateLoad(i64, B.CreateGEP(poolTy, pool, {B.getInt64(0), tgt}));
       l->setVolatile(true);
       storeReg(dst, l);
+      finish(pc4);
+      continue;
+    }
+    if (base == OP_PUSHARG) {
+      Value *n = B.CreateLoad(i64, argn);
+      B.CreateStore(loadReg(ra), B.CreateGEP(argbufTy, argbuf, {B.getInt64(0), n}));
+      B.CreateStore(B.CreateAdd(n, B.getInt64(1)), argn);
+      finish(pc4);
+      continue;
+    }
+    if (base == OP_CALL && calleeTable) {
+      // reg[dst] = calleetable[ra](argbuf[0..5]); a uniform i64(i64x6) thunk is ABI-safe for the
+      // <=6 integer/pointer args the eligibility check guarantees.
+      Value *fp = B.CreateLoad(ptrTy, B.CreateGEP(ctTy, calleeTable, {B.getInt64(0), ra}));
+      FunctionType *thunk = FunctionType::get(i64, {i64, i64, i64, i64, i64, i64}, false);
+      SmallVector<Value *, 6> cargs;
+      for (unsigned k = 0; k < 6; k++)
+        cargs.push_back(B.CreateLoad(i64, B.CreateGEP(argbufTy, argbuf, {B.getInt64(0), B.getInt64(k)})));
+      storeReg(dst, B.CreateCall(thunk, fp, cargs));
+      B.CreateStore(B.getInt64(0), argn);
       finish(pc4);
       continue;
     }

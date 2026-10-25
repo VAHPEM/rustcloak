@@ -94,7 +94,10 @@ Each transform lives in its own source file and can be used alone or together.
    instruction — register indices, pool indices and branch targets included — is build-specific and
    the interpreter decrypts each operand after fetch. Each width-sensitive opcode still carries its
    width in its two high bits; the bytecode and pool are mutable globals read through volatile loads.
-   Left native: **calls**, globals, floats, vectors. Verified
+   Direct **function calls** are virtualized too (round 6): `PUSHARG`/`CALL` opcodes stage the
+   arguments and dispatch through a per-function callee-pointer table, so a function that calls
+   helpers virtualizes whole (direct, non-vararg, non-intrinsic callees with ≤6 integer/pointer
+   args). Left native: indirect/vararg/intrinsic calls, global references, floats, vectors. Verified
    behaviour-identical to native on x86-64 and AArch64 over a 20,000-iteration stress fold through
    real buffers, across seeds (each a different opcode map).
 
