@@ -52,6 +52,22 @@ inline std::mt19937_64 rng(llvm::StringRef tag) {
   return std::mt19937_64(baseSeed() ^ h);
 }
 
+// A seeded, innocuous-looking identifier for an injected global/function. The obfuscator must
+// NOT name its own artifacts (`rustcloak.decrypt`, `cloak.state`, ...): those names are a trivial
+// grep/YARA signature that identifies the tool and locates the decryptor and dispatcher in any
+// non-stripped build. Names are derived from the build seed + `tag`, so a given tag maps to one
+// stable name within a build (globals reused by tag still resolve) and differs across builds.
+// Local values and blocks get no name at all (LLVM auto-numbers them) -- see the passes.
+inline std::string anon(llvm::StringRef tag) {
+  auto g = rng(("name:" + tag).str());
+  static const char lead[] = "abcdefghijklmnopqrstuvwxyz";
+  static const char body[] = "abcdefghijklmnopqrstuvwxyz0123456789";
+  std::string s(1, lead[g() % 26]);
+  for (int i = 0; i < 9; i++)
+    s += body[g() % 36];
+  return s;
+}
+
 } // namespace rustcloak
 
 // Each transform as a new-PM pass. run() is defined in the matching .cpp.

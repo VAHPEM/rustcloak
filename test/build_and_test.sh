@@ -32,8 +32,11 @@ cmake -S . -B build -G Ninja -DLLVM_DIR="$LLVM_DIR" >/dev/null
 cmake --build build >/dev/null
 PLUGIN=build/libRustCloak.so
 
-# Arch-independent flatten markers injected by the pass (kept only with value names preserved).
-MARK='cloak\.(dispatch|state|next|cur)'
+# Name-independent flatten signal: the dispatcher is a `switch` with one arm per original block,
+# so the IR has many `i32 <const>, label %...` case arms where a normal function has ~none. This
+# does not rely on the pass's symbol names (which are deliberately anonymised per build), and the
+# count is identical on any target because it is read from LLVM IR, before codegen.
+arms() { grep -oE "i32 -?[0-9]+, label %" "$1" | wc -l; }
 VN='-fno-discard-value-names'
 
 echo "== baseline (IR + optional native run) =="
@@ -44,7 +47,7 @@ if [ "$RUN" = 1 ]; then $CLANG -O0 $TGT build/demo.ll -o build/demo_orig; ORIG=$
 echo "== flatten (IR) =="
 $OPT -load-pass-plugin=$PLUGIN -passes=flatten build/demo.ll -S -o build/demo_flat.ll
 $OPT -passes=verify build/demo_flat.ll >/dev/null && echo "  IR verifies"
-markers=$(grep -cE "$MARK" build/demo_flat.ll || true)
+markers=$(arms build/demo_flat.ll)
 FLAT="$ORIG"
 if [ "$RUN" = 1 ]; then $CLANG -O0 $TGT build/demo_flat.ll -o build/demo_flat; FLAT=$(./build/demo_flat); fi
 
@@ -57,7 +60,7 @@ if [ "$RUN" = 1 ]; then $CLANG -O0 $TGT build/demo_enc.ll -o build/demo_enc; ENC
 
 echo "== full -O2 (-fpass-plugin, late ordering) =="
 $CLANG -O2 $VN $TGT -fpass-plugin=$PLUGIN -emit-llvm -S test/demo.c -o build/demo_hard.ll
-o2_markers=$(grep -cE "$MARK" build/demo_hard.ll || true)        # obfuscation survived the optimizer
+o2_markers=$(arms build/demo_hard.ll)        # dispatcher survived the optimizer (name-independent)
 $CLANG -O2 $TGT -fpass-plugin=$PLUGIN -c test/demo.c -o build/demo_hard.o
 o2_leak=$(strings build/demo_hard.o | grep -c "flatten-demo" || true)
 o2_cmp=$($OBJDUMP -d --no-show-raw-insn build/demo_hard.o 2>/dev/null | sed -n '/<decode>:/,/^$/p' \
@@ -71,9 +74,9 @@ echo "  strenc : out='${ENC}' plaintext_leak=$enc_leak"
 echo "  -O2    : out='${HARD}' survived_markers=$o2_markers plaintext_leak=$o2_leak dispatcher_insns=$o2_cmp"
 
 ok=1
-[ "$markers" -gt 0 ] || { echo "FAIL flatten: no markers"; ok=0; }
+[ "$markers" -ge 5 ] || { echo "FAIL flatten: no dispatcher switch ($markers arms)"; ok=0; }
 [ "$enc_leak" -eq 0 ] || { echo "FAIL strenc: plaintext leaked"; ok=0; }
-[ "$o2_markers" -gt 0 ] && [ "$o2_leak" -eq 0 ] || { echo "FAIL -O2: not survived / leaked"; ok=0; }
+[ "$o2_markers" -ge 5 ] && [ "$o2_leak" -eq 0 ] || { echo "FAIL -O2: dispatcher gone ($o2_markers) / leaked"; ok=0; }
 if [ "$RUN" = 1 ]; then
   [ "$ORIG" = "$FLAT" ] || { echo "FAIL flatten: behaviour changed"; ok=0; }
   [ "$ORIG" = "$ENC" ]  || { echo "FAIL strenc: behaviour changed"; ok=0; }

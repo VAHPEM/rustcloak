@@ -26,7 +26,7 @@ using namespace llvm;
 namespace {
 
 GlobalVariable *internalI32(Module &M, StringRef name) {
-  if (auto *G = M.getGlobalVariable(name))
+  if (auto *G = M.getGlobalVariable(name, /*AllowInternal=*/true))
     return G;
   Type *I32 = Type::getInt32Ty(M.getContext());
   auto *G = new GlobalVariable(M, I32, /*isConstant=*/false,
@@ -38,11 +38,11 @@ GlobalVariable *internalI32(Module &M, StringRef name) {
 // Build an always-true i1 that the optimizer cannot fold: (x*(x+1)) & 1 == 0.
 Value *opaqueTrue(IRBuilder<> &B, Module &M) {
   Type *I32 = Type::getInt32Ty(M.getContext());
-  Value *x = B.CreateLoad(I32, internalI32(M, "rustcloak.x"), "ox");
+  Value *x = B.CreateLoad(I32, internalI32(M, rustcloak::anon("ox")), "");
   Value *xp1 = B.CreateAdd(x, ConstantInt::get(I32, 1));
   Value *prod = B.CreateMul(x, xp1);
   Value *lo = B.CreateAnd(prod, ConstantInt::get(I32, 1));
-  return B.CreateICmpEQ(lo, ConstantInt::get(I32, 0), "opaque");
+  return B.CreateICmpEQ(lo, ConstantInt::get(I32, 0), "");
 }
 
 bool bogusBlock(BasicBlock *BB, Module &M, std::mt19937_64 &gen) {
@@ -61,20 +61,20 @@ bool bogusBlock(BasicBlock *BB, Module &M, std::mt19937_64 &gen) {
   if (split == BB->getTerminator())
     return false;
 
-  BasicBlock *tail = BB->splitBasicBlock(split, "bcf.tail");
+  BasicBlock *tail = BB->splitBasicBlock(split, "");
   // BB now ends in `br tail`; replace with an opaque-guarded branch to tail or bogus.
   Instruction *term = BB->getTerminator();
   IRBuilder<> B(term);
   Value *cond = opaqueTrue(B, M);
 
-  BasicBlock *bogus = BasicBlock::Create(M.getContext(), "bcf.bogus", BB->getParent(), tail);
+  BasicBlock *bogus = BasicBlock::Create(M.getContext(), "", BB->getParent(), tail);
   IRBuilder<> BB2(bogus);
   // junk that cannot be trivially removed: a volatile store to a sink global.
   Type *I32 = Type::getInt32Ty(M.getContext());
-  Value *x = BB2.CreateLoad(I32, internalI32(M, "rustcloak.x"));
+  Value *x = BB2.CreateLoad(I32, internalI32(M, rustcloak::anon("ox")));
   Value *junk = BB2.CreateXor(BB2.CreateMul(x, ConstantInt::get(I32, (uint32_t)(gen() | 1))),
                               ConstantInt::get(I32, (uint32_t)gen()));
-  BB2.CreateStore(junk, internalI32(M, "rustcloak.sink"))->setVolatile(true);
+  BB2.CreateStore(junk, internalI32(M, rustcloak::anon("sink")))->setVolatile(true);
   BB2.CreateBr(tail);               // tail has no PHIs (split mid-block), so this is safe
 
   BranchInst::Create(tail, bogus, cond, term);

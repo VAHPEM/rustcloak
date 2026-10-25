@@ -24,12 +24,12 @@ namespace {
 // A shared helper: void xor(i8* p, i64 len, i8 key) { for i: p[i] ^= key + (i8)i; }
 Function *getXorHelper(Module &M) {
   LLVMContext &Ctx = M.getContext();
-  if (Function *F = M.getFunction("rustcloak.xor"))
+  if (Function *F = M.getFunction(rustcloak::anon("xorh")))
     return F;
   Type *I8 = Type::getInt8Ty(Ctx), *I64 = Type::getInt64Ty(Ctx);
   Type *I8P = PointerType::getUnqual(Ctx);
   FunctionType *FT = FunctionType::get(Type::getVoidTy(Ctx), {I8P, I64, I8}, false);
-  Function *F = Function::Create(FT, GlobalValue::InternalLinkage, "rustcloak.xor", M);
+  Function *F = Function::Create(FT, GlobalValue::InternalLinkage, rustcloak::anon("xorh"), M);
   Argument *P = F->getArg(0), *Len = F->getArg(1), *Key = F->getArg(2);
 
   BasicBlock *Entry = BasicBlock::Create(Ctx, "entry", F);
@@ -109,7 +109,7 @@ PreservedAnalyses StrEncPass::run(Module &M, ModuleAnalysisManager &) {
 
   Function *Helper = getXorHelper(M);
   FunctionType *FT = FunctionType::get(Type::getVoidTy(Ctx), false);
-  Function *Ctor = Function::Create(FT, GlobalValue::InternalLinkage, "rustcloak.decrypt", M);
+  Function *Ctor = Function::Create(FT, GlobalValue::InternalLinkage, rustcloak::anon("dctor"), M);
   BasicBlock *BB = BasicBlock::Create(Ctx, "entry", Ctor);
   IRBuilder<> B(BB);
   Type *I8 = Type::getInt8Ty(Ctx), *I64 = Type::getInt64Ty(Ctx);

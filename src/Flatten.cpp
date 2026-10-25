@@ -104,7 +104,7 @@ bool flatten(Function &F, std::mt19937_64 &rng) {
   BasicBlock *Entry = &F.getEntryBlock();
   if (auto *Br = dyn_cast<BranchInst>(Entry->getTerminator()))
     if (Br->isConditional())
-      Entry->splitBasicBlock(Br, "entry.split");
+      Entry->splitBasicBlock(Br, "");
 
   auto *EntryBr = dyn_cast<BranchInst>(Entry->getTerminator());
   if (!EntryBr || EntryBr->isConditional())
@@ -135,17 +135,17 @@ bool flatten(Function &F, std::mt19937_64 &rng) {
   }
 
   IRBuilder<> B(EntryBr);
-  AllocaInst *SwVar = B.CreateAlloca(I32, nullptr, "cloak.state");
+  AllocaInst *SwVar = B.CreateAlloca(I32, nullptr, "");
   B.CreateStore(B.getInt32(State[First]), SwVar);
 
-  BasicBlock *Dispatch = BasicBlock::Create(Ctx, "cloak.dispatch", &F);
-  BasicBlock *DispatchEnd = BasicBlock::Create(Ctx, "cloak.dispatch.end", &F);
+  BasicBlock *Dispatch = BasicBlock::Create(Ctx, "", &F);
+  BasicBlock *DispatchEnd = BasicBlock::Create(Ctx, "", &F);
 
   EntryBr->eraseFromParent();
   BranchInst::Create(Dispatch, Entry);
 
   IRBuilder<> BD(Dispatch);
-  LoadInst *Cur = BD.CreateLoad(I32, SwVar, "cloak.cur");
+  LoadInst *Cur = BD.CreateLoad(I32, SwVar, "");
   BD.CreateBr(DispatchEnd);
 
   SwitchInst *SW = SwitchInst::Create(Cur, Dispatch, Blocks.size(), DispatchEnd);
@@ -165,7 +165,7 @@ bool flatten(Function &F, std::mt19937_64 &rng) {
     } else {
       Value *Sel = BB_.CreateSelect(Br->getCondition(),
                                     BB_.getInt32(State[Br->getSuccessor(0)]),
-                                    BB_.getInt32(State[Br->getSuccessor(1)]), "cloak.next");
+                                    BB_.getInt32(State[Br->getSuccessor(1)]), "");
       BB_.CreateStore(Sel, SwVar);
     }
     BB_.CreateBr(Dispatch);
