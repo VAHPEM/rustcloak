@@ -113,6 +113,21 @@ Each transform lives in its own source file and can be used alone or together.
    mode. `test/select.sh` checks each mode virtualizes exactly the intended functions and that
    behaviour is preserved whatever the selection.
 
+   **Nested virtualization — VM-in-VM (`RUSTCLOAK_VM_NEST=1`).** The layer-0 interpreter is itself a
+   function, so it can be virtualized a second time: its dispatch loop, opcode handlers and operand
+   decode all become bytecode for a *second*, independently-encoded VM (a different opcode permutation
+   and operand key). An analyst who reconstructs the outer VM finds, where the program logic should
+   be, only another fetch-decode-dispatch loop to reverse — the multi-layer model of VMProtect /
+   Themida. To make the interpreter re-eligible the second pass adds two opcodes the base VM never
+   needs (`OP_GLOBAL` to materialise a referenced data global's address through a pointer table, and
+   `OP_ALLOCA` for the interpreter's register-file stack slot) and first lowers the dispatch `switch`
+   to a branch chain, de-volatilises the bytecode loads, and turns the unreachable default into a
+   return. It is best-effort: an interpreter that still has an indirect callee-table call (i.e. the
+   virtualized function made calls) is left as the correct single layer. On the single-call fixture
+   the bytecode grows ~14× (it now encodes the whole interpreter); `test/nest.sh` confirms nesting
+   engages and stays behaviour-identical on x86-64, AArch64 and Windows PE plus a differential fuzz.
+   Nested code runs ~two orders of magnitude slower, so pair it with selective virtualization.
+
    **Anti-tamper bytecode integrity (`RUSTCLOAK_VM_INTEGRITY=1`).** On top of the per-build operand
    encryption, the interpreter can hash *its own bytecode* at run time (FNV-1a-64 over the blob, via
    the same volatile loads it executes) and XOR-fold the result into the operand-decryption keys. For
@@ -182,6 +197,7 @@ opt-18 -load-pass-plugin=build/libRustCloak.so -passes='strenc,function(subst,bo
 #   RUSTCLOAK_VM_ONLY=a,b   virtualize only functions whose name contains a or b
 #   RUSTCLOAK_VM_SKIP=a,b   never virtualize functions whose name contains a or b
 #   RUSTCLOAK_VM_RATIO=P    virtualize a seeded ~P% of the otherwise-chosen functions
+#   RUSTCLOAK_VM_NEST=1     re-virtualize the interpreter itself (VM-in-VM; ~100x slower)
 #   RUSTCLOAK_VM_INTEGRITY=1  VM self-hashes its bytecode; tampering corrupts the operand keys
 #   RUSTCLOAK_OFF=1      disable all transforms (safety off-switch; emit a normal build)
 ```

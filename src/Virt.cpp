@@ -37,6 +37,7 @@
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/Instructions.h"
 #include "llvm/IR/Module.h"
+#include "llvm/Support/Alignment.h"
 #include "llvm/Transforms/Utils/BasicBlockUtils.h"
 #include "llvm/Transforms/Utils/Cloning.h"
 
@@ -73,6 +74,10 @@ enum Op : uint8_t {
   OP_RETV = 35,   // return void
   OP_PUSHARG = 36,// argbuf[argn++] = reg[a]   (stage one call argument)
   OP_CALL = 37,   // reg[dst] = calleetable[a](argbuf...); argn = 0   (a = callee index)
+  // Only emitted for a NESTED (layer>0) pass, where the function being virtualized is itself an
+  // interpreter and so references data globals and has stack allocas (both left native at layer 0):
+  OP_GLOBAL = 38, // reg[dst] = &globaltable[a]      (address of a referenced data global)
+  OP_ALLOCA = 39, // reg[dst] = alloca i8 x pool[a|b<<8]   (a fixed-size stack allocation)
 };
 
 static uint8_t wcodeOf(unsigned bits) {
@@ -91,6 +96,9 @@ struct Prog {
   std::vector<unsigned> temps;          // PHI copy temporaries
   unsigned gepTmp = 0;                   // one scratch reg for GEP address arithmetic
   unsigned nreg = 0;
+  // nested-layer only: referenced data globals and their registers (see OP_GLOBAL)
+  std::vector<GlobalVariable *> globals;
+  DenseMap<GlobalVariable *, unsigned> gslot;
 };
 
 static uint8_t cmpBase(CmpInst::Predicate p) {
@@ -114,7 +122,9 @@ static bool isRegTy(Type *T) {
   return (T->isIntegerTy() && T->getIntegerBitWidth() <= 64) || T->isPointerTy();
 }
 
-static bool okOperand(Value *v) {
+static bool okOperand(Value *v, bool allowGlobal = false) {
+  if (allowGlobal && isa<GlobalVariable>(v))
+    return true;                         // nested layer: data-global address via OP_GLOBAL
   return isa<Argument>(v) || isa<Instruction>(v) || isa<ConstantInt>(v) ||
          isa<UndefValue>(v) || isa<ConstantPointerNull>(v);
 }
@@ -239,7 +249,9 @@ static bool selectedForVirt(Function &F) {
   return true;
 }
 
-static bool eligible(Function &F) {
+// `nested` is true for a layer>0 pass, where F is itself an interpreter: it then also accepts static
+// stack allocas (OP_ALLOCA) and references to data globals (OP_GLOBAL), which layer 0 leaves native.
+static bool eligible(Function &F, bool nested = false) {
   if (F.isDeclaration() || F.isVarArg())
     return false;
   for (Argument &A : F.args())
@@ -304,6 +316,8 @@ static bool eligible(Function &F) {
         ok = isRegTy(I.getType());
       } else if (auto *ci = dyn_cast<CallInst>(&I)) {
         ok = virtCallee(ci) != nullptr;
+      } else if (auto *al = dyn_cast<AllocaInst>(&I)) {
+        ok = nested && al->isStaticAlloca();   // fixed-size stack slot, nested layer only
       } else if (isa<ReturnInst>(&I) || isa<BranchInst>(&I)) {
         ok = true;
       }
@@ -315,7 +329,7 @@ static bool eligible(Function &F) {
           continue;
         if (callI && op == callI->getCalledOperand())
           continue;                      // the callee (a Function) is handled via the callee table
-        if (!okOperand(op))
+        if (!okOperand(op, nested))
           return false;                  // globals / constexprs / float consts -> native
       }
     }
@@ -367,15 +381,13 @@ static void inlineTinyCallees(Function &F) {
 
 } // namespace
 
-PreservedAnalyses VirtPass::run(Function &F, FunctionAnalysisManager &) {
-  if (!getenv("RUSTCLOAK_VM"))
-    return PreservedAnalyses::all();
-  if (!selectedForVirt(F))               // selective/partial scoping (see selectedForVirt)
-    return PreservedAnalyses::all();
-  if (getenv("RUSTCLOAK_VM_INLINE"))
-    inlineTinyCallees(F);                // fold tiny leaf callees in before virtualizing
-  if (!eligible(F))
-    return PreservedAnalyses::all();
+// One virtualization layer: rebuild F as a bytecode interpreter. `layer` seeds a distinct opcode map
+// and operand keys, so a nested second pass (layer 1, over the layer-0 interpreter) gets a different
+// VM instruction set. Returns true if F was virtualized, false if it was left unchanged (ineligible).
+static bool virtualizeOnce(Function &F, unsigned layer) {
+  bool nested = layer > 0;
+  if (!eligible(F, nested))
+    return false;
 
   // Per-build, per-function opcode encoding with SYNONYMS. The low 6 bits of the opcode byte are a
   // slot; each logical base owns one or more slots (frequent ops own several), and emit() picks a
@@ -383,8 +395,9 @@ PreservedAnalyses VirtPass::run(Function &F, FunctionAnalysisManager &) {
   // cannot tag "the most common opcode" as ADD. `dec` maps every slot back to its logical base; the
   // width still rides in the top two bits. The layout is seeded, so two builds (or two functions)
   // share no instruction set.
-  std::mt19937_64 encRng = rustcloak::rng(("vmenc:" + F.getName()).str());
-  const unsigned NBASE = OP_CALL + 1;    // logical bases 0..OP_CALL
+  std::mt19937_64 encRng =
+      rustcloak::rng(("vmenc:" + std::to_string(layer) + ":" + F.getName()).str());
+  const unsigned NBASE = OP_ALLOCA + 1;  // logical bases 0..OP_ALLOCA
   auto weightOf = [](unsigned b) -> unsigned {
     switch (b) {
     case OP_MOV: case OP_CONST: case OP_ADD: case OP_SUB:
@@ -420,7 +433,8 @@ PreservedAnalyses VirtPass::run(Function &F, FunctionAnalysisManager &) {
   // the three operand bytes (dst, a, b) are XOR-encrypted with a per-build/per-function key, so the
   // whole 4-byte instruction -- not just the opcode -- is build-specific; the interpreter decrypts
   // each operand after fetch. (Register indices, pool indices and branch targets are all hidden.)
-  std::mt19937_64 kg = rustcloak::rng(("vmkey:" + F.getName()).str());
+  std::mt19937_64 kg =
+      rustcloak::rng(("vmkey:" + std::to_string(layer) + ":" + F.getName()).str());
   uint8_t kd = kg() & 0xff, ka = kg() & 0xff, kb = kg() & 0xff;
   // Anti-tamper (RUSTCLOAK_VM_INTEGRITY): the interpreter hashes its own bytecode at run time and
   // folds the hash into these operand keys, so patching any bytecode byte silently corrupts every
@@ -496,6 +510,21 @@ PreservedAnalyses VirtPass::run(Function &F, FunctionAnalysisManager &) {
           wantConst(constOff);
       }
     }
+  // nested layer: a register per referenced data global (OP_GLOBAL fills it), and each static
+  // alloca's byte size in the pool (OP_ALLOCA reads it). Collected before the OP_CONST prologue.
+  if (nested)
+    for (BasicBlock &BB : F)
+      for (Instruction &I : BB) {
+        for (Value *op : I.operands())
+          if (auto *gv = dyn_cast<GlobalVariable>(op))
+            if (!P.gslot.count(gv)) {
+              P.gslot[gv] = P.nreg++;
+              P.globals.push_back(gv);
+            }
+        if (auto *al = dyn_cast<AllocaInst>(&I))
+          if (auto sz = al->getAllocationSize(DL))
+            wantConst(sz->getFixedValue());
+      }
   wantConst(0);
   for (unsigned i = 0; i < maxPhi; i++)
     P.temps.push_back(P.nreg++);
@@ -514,13 +543,15 @@ PreservedAnalyses VirtPass::run(Function &F, FunctionAnalysisManager &) {
             callees.push_back(c);
           }
   if (P.nreg > 256 || P.consts.size() > 0xffff || callees.size() > 256)
-    return PreservedAnalyses::all();
+    return false;
 
   auto regOf = [&](Value *v) -> unsigned {
     if (auto *ci = dyn_cast<ConstantInt>(v))
       return P.creg[ci->getZExtValue()];
     if (isa<UndefValue>(v) || isa<ConstantPointerNull>(v))
       return P.creg[0];
+    if (auto *gv = dyn_cast<GlobalVariable>(v))
+      return P.gslot[gv];                // nested layer: data global's address register
     return P.slot[v];
   };
 
@@ -532,6 +563,8 @@ PreservedAnalyses VirtPass::run(Function &F, FunctionAnalysisManager &) {
   };
   for (auto &kv : P.creg)
     emit(OP_CONST, 64, kv.second, P.cpoolIdx[kv.first] & 0xff, P.cpoolIdx[kv.first] >> 8);
+  for (unsigned gi = 0; gi < P.globals.size(); gi++)   // nested: load each data global's address
+    emit(OP_GLOBAL, 64, P.gslot[P.globals[gi]], gi & 0xff, gi >> 8);
 
   auto phiCopies = [&](BasicBlock *pred, BasicBlock *S) {
     unsigned i = 0;
@@ -596,7 +629,7 @@ PreservedAnalyses VirtPass::run(Function &F, FunctionAnalysisManager &) {
           {Instruction::URem, OP_UREM}, {Instruction::SRem, OP_SREM}};
         auto f = M.find(bo->getOpcode());
         if (f == M.end())
-          return PreservedAnalyses::all();
+          return false;
         emit(f->second, widthOf(bo), d, regOf(bo->getOperand(0)), regOf(bo->getOperand(1)));
       } else if (auto *ic = dyn_cast<ICmpInst>(&I)) {
         emit(cmpBase(ic->getPredicate()), widthOf(ic->getOperand(0)), d,
@@ -634,6 +667,9 @@ PreservedAnalyses VirtPass::run(Function &F, FunctionAnalysisManager &) {
           if (rw == 8 || rw == 16 || rw == 32) callw = rw;
         }
         emit(OP_CALL, callw, rd, calleeIdx[ci->getCalledFunction()], 0);
+      } else if (auto *al = dyn_cast<AllocaInst>(&I)) {   // nested layer only
+        unsigned ci = P.cpoolIdx[al->getAllocationSize(DL)->getFixedValue()];
+        emit(OP_ALLOCA, 64, d, ci & 0xff, ci >> 8);
       }
     }
     Instruction *term = BB->getTerminator();
@@ -657,7 +693,7 @@ PreservedAnalyses VirtPass::run(Function &F, FunctionAnalysisManager &) {
   // Branch/jump targets are encoded in two bytes (offset <= 0xffff). A larger bytecode would
   // silently truncate them, so leave such a (large) function native. (bug fix)
   if (code.size() * 4 > 0xffff)
-    return PreservedAnalyses::all();
+    return false;
 
   std::vector<uint8_t> bytes;
   bytes.reserve(code.size() * 4);
@@ -696,6 +732,14 @@ PreservedAnalyses VirtPass::run(Function &F, FunctionAnalysisManager &) {
     std::vector<Constant *> cv(callees.begin(), callees.end());
     calleeTable = new GlobalVariable(M, ctTy, false, GlobalValue::InternalLinkage,
                                      ConstantArray::get(ctTy, cv), rustcloak::anon("vc"));
+  }
+  // nested layer: a pointer table of the referenced data globals the OP_GLOBAL opcode indexes
+  ArrayType *gtTy = ArrayType::get(ptrTy, std::max<size_t>(P.globals.size(), 1));
+  GlobalVariable *globalTable = nullptr;
+  if (!P.globals.empty()) {
+    std::vector<Constant *> gv(P.globals.begin(), P.globals.end());
+    globalTable = new GlobalVariable(M, gtTy, false, GlobalValue::InternalLinkage,
+                                     ConstantArray::get(gtTy, gv), rustcloak::anon("vg"));
   }
 
   // ---- rebuild F as the interpreter ----------------------------------------
@@ -831,6 +875,21 @@ PreservedAnalyses VirtPass::run(Function &F, FunctionAnalysisManager &) {
       finish(pc4);
       continue;
     }
+    if (base == OP_GLOBAL && globalTable) {       // reg[dst] = (i64)&globaltable[tgt]
+      Value *gp = B.CreateLoad(ptrTy, B.CreateGEP(gtTy, globalTable, {B.getInt64(0), tgt}));
+      storeReg(dst, B.CreatePtrToInt(gp, i64));
+      finish(pc4);
+      continue;
+    }
+    if (base == OP_ALLOCA) {                       // reg[dst] = (i64)alloca i8 x pool[tgt]
+      LoadInst *szl = B.CreateLoad(i64, B.CreateGEP(poolTy, pool, {B.getInt64(0), tgt}));
+      szl->setVolatile(true);
+      AllocaInst *mem = B.CreateAlloca(i8, szl);
+      mem->setAlignment(Align(16));               // satisfies any i8/i16/i32/i64 lane access
+      storeReg(dst, B.CreatePtrToInt(mem, i64));
+      finish(pc4);
+      continue;
+    }
     if (base == OP_PUSHARG) {
       Value *n = B.CreateLoad(i64, argn);
       B.CreateStore(loadReg(ra), B.CreateGEP(argbufTy, argbuf, {B.getInt64(0), n}));
@@ -914,5 +973,88 @@ PreservedAnalyses VirtPass::run(Function &F, FunctionAnalysisManager &) {
 
   B.SetInsertPoint(bad);
   B.CreateUnreachable();
+  return true;
+}
+
+// Make a just-built layer-0 interpreter eligible for a second virtualization pass. (Defined below.)
+static void prepareForRevirt(Function &F);
+
+PreservedAnalyses VirtPass::run(Function &F, FunctionAnalysisManager &) {
+  if (!getenv("RUSTCLOAK_VM"))
+    return PreservedAnalyses::all();
+  if (!selectedForVirt(F))                 // selective/partial scoping (see selectedForVirt)
+    return PreservedAnalyses::all();
+  if (getenv("RUSTCLOAK_VM_INLINE"))
+    inlineTinyCallees(F);                  // fold tiny leaf callees in before virtualizing
+  if (!virtualizeOnce(F, 0))
+    return PreservedAnalyses::all();
+  // Nested virtualization (RUSTCLOAK_VM_NEST): re-virtualize the layer-0 interpreter so its own
+  // dispatch loop becomes bytecode for a second, differently-encoded VM -- the multi-layer model of
+  // VMProtect/Themida. prepareForRevirt makes the interpreter re-eligible (lower the dispatch switch
+  // to a branch tree, de-volatilize the bytecode loads, turn the `unreachable` into a return). The
+  // second pass is best-effort: if the interpreter still isn't eligible (e.g. it has an indirect
+  // callee-table call), virtualizeOnce leaves it as the correct single layer.
+  if (getenv("RUSTCLOAK_VM_NEST")) {
+    prepareForRevirt(F);
+    virtualizeOnce(F, 1);
+  }
   return PreservedAnalyses::none();
+}
+
+// Lower a switch into an equivalent icmp/branch chain (the VM accepts only branch/return
+// terminators). Assumes the case successors have no PHIs -- true for the interpreter's dispatch,
+// whose handlers take no PHI operands (the loop's pc PHI is fed by the handlers, not the switch).
+static void lowerSwitch(SwitchInst *sw) {
+  BasicBlock *BB = sw->getParent();
+  Function *F = BB->getParent();
+  LLVMContext &C = F->getContext();
+  Value *cond = sw->getCondition();
+  BasicBlock *defd = sw->getDefaultDest();
+  std::vector<std::pair<ConstantInt *, BasicBlock *>> cases;
+  for (auto cs : sw->cases())
+    cases.push_back({cs.getCaseValue(), cs.getCaseSuccessor()});
+  sw->eraseFromParent();                       // BB loses its terminator; rebuilt below
+  IRBuilder<> B(BB);
+  BasicBlock *cur = BB;
+  for (auto &kv : cases) {
+    B.SetInsertPoint(cur);
+    Value *e = B.CreateICmpEQ(cond, kv.first);
+    BasicBlock *next = BasicBlock::Create(C, "", F);
+    B.CreateCondBr(e, kv.second, next);
+    cur = next;
+  }
+  B.SetInsertPoint(cur);
+  B.CreateBr(defd);
+}
+
+// Make a just-built layer-0 interpreter eligible for a second virtualization pass: drop the
+// volatile markers (nothing runs after OptimizerLast to re-fold them, and they become layer-1
+// bytecode anyway), turn the unreachable default into a return, and lower the dispatch switch to a
+// branch chain. A function whose interpreter still has an indirect callee-table call stays
+// ineligible and is left as the correct single layer.
+static void prepareForRevirt(Function &F) {
+  for (BasicBlock &BB : F)
+    for (Instruction &I : BB) {
+      if (auto *l = dyn_cast<LoadInst>(&I))
+        l->setVolatile(false);
+      else if (auto *s = dyn_cast<StoreInst>(&I))
+        s->setVolatile(false);
+    }
+  Type *retTy = F.getReturnType();
+  for (BasicBlock &BB : F)
+    if (isa<UnreachableInst>(BB.getTerminator())) {
+      Instruction *term = BB.getTerminator();
+      IRBuilder<> B(term);
+      if (retTy->isVoidTy())
+        B.CreateRetVoid();
+      else
+        B.CreateRet(UndefValue::get(retTy));
+      term->eraseFromParent();
+    }
+  std::vector<SwitchInst *> sws;
+  for (BasicBlock &BB : F)
+    if (auto *sw = dyn_cast<SwitchInst>(BB.getTerminator()))
+      sws.push_back(sw);
+  for (SwitchInst *sw : sws)
+    lowerSwitch(sw);
 }
