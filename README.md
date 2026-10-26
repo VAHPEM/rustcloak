@@ -56,6 +56,14 @@ Each transform lives in its own source file and can be used alone or together.
    nothing decodes. (Combines with lazy or eager mode. Countered in turn by an analyzer that replays
    global constructors first — see the red/blue notes — which is the point: it raises the floor.)
 
+   With **`RUSTCLOAK_STRENC_SELFKEY=1`** the marker is taken one step further: instead of a
+   constructor storing a per-build `MAGIC` constant, the constructor **computes** the marker at run
+   time as an FNV-1a hash of the ciphertext itself (the encrypted string bytes, which are known at
+   compile time, so the compile-time `MAGIC` is set to match). The key is then never a constant a
+   static tool can read — to learn it, a tool must actually execute the hash over the real encrypted
+   data. It also ties the key to the exact ciphertext, so editing the encrypted bytes changes the
+   marker and corrupts every string (`test/selfkey.sh`).
+
 3. **Instruction substitution — `subst` (`src/Subst.cpp`).** Replaces arithmetic/logic with
    **mixed boolean-arithmetic (MBA)** expressions, each proven equivalent for all inputs with z3 —
    `a + b` → `(a ^ b) + 2·(a & b)`, `a - b` → `(a ^ b) − 2·(~a & b)`, `a ^ b` → `(a | b) − (a & b)`,
@@ -200,6 +208,7 @@ opt-18 -load-pass-plugin=build/libRustCloak.so -passes='strenc,function(subst,bo
 #   RUSTCLOAK_SEED=N     reproducible build (default: random per build)
 #   RUSTCLOAK_LAZY=1     decrypt each string on first use, not all at startup
 #   RUSTCLOAK_ANTIEMU=1  bind string keys to a loader-set marker (defeats isolated emulation)
+#   RUSTCLOAK_STRENC_SELFKEY=1  derive that marker by hashing the ciphertext (key is never a constant)
 #   RUSTCLOAK_VM=1       virtualize eligible functions into custom-bytecode + interpreter
 #   RUSTCLOAK_VM_SELECTIVE=1  virtualize only sensitive-named functions (not every eligible one)
 #   RUSTCLOAK_VM_ONLY=a,b   virtualize only functions whose name contains a or b

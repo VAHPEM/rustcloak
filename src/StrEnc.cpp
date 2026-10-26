@@ -137,6 +137,44 @@ void emitMarkerCtor(Module &M, const AntiEmu &ae) {
   appendToGlobalCtors(M, C, 0);                          // priority 0: runs before the decryptor (1)
 }
 
+// RUSTCLOAK_STRENC_SELFKEY: a constructor that COMPUTES the marker at run time as FNV-1a-32 over
+// `len` bytes of `anchor` (the still-encrypted string data), instead of storing a constant. `magic`
+// is the same hash computed at compile time, so at run time marker == magic and the decryption is
+// correct -- but a static deobfuscator can no longer read a stored `magic`; to learn it, it must
+// actually execute this hash over the real ciphertext. Runs at priority 0 (before the decryptor at
+// 1), so it hashes ciphertext. Because the marker also depends on the exact ciphertext bytes, any
+// edit to the encrypted data changes the key and corrupts every decrypted string (anti-tamper bonus).
+void emitComputedMarkerCtor(Module &M, const AntiEmu &ae, GlobalVariable *anchor, uint64_t len) {
+  LLVMContext &Ctx = M.getContext();
+  Type *I8 = Type::getInt8Ty(Ctx), *I32 = Type::getInt32Ty(Ctx), *I64 = Type::getInt64Ty(Ctx);
+  Function *C = Function::Create(FunctionType::get(Type::getVoidTy(Ctx), false),
+                                 GlobalValue::InternalLinkage, rustcloak::anon("mkc"), M);
+  BasicBlock *Entry = BasicBlock::Create(Ctx, "entry", C);
+  BasicBlock *Cond = BasicBlock::Create(Ctx, "cond", C);
+  BasicBlock *Body = BasicBlock::Create(Ctx, "body", C);
+  BasicBlock *Exit = BasicBlock::Create(Ctx, "exit", C);
+  IRBuilder<> B(Entry);
+  AllocaInst *I = B.CreateAlloca(I64);
+  B.CreateStore(ConstantInt::get(I64, 0), I);
+  AllocaInst *H = B.CreateAlloca(I32);
+  B.CreateStore(ConstantInt::get(I32, 2166136261u), H);    // FNV-1a-32 offset basis
+  B.CreateBr(Cond);
+  B.SetInsertPoint(Cond);
+  Value *iv = B.CreateLoad(I64, I);
+  B.CreateCondBr(B.CreateICmpULT(iv, ConstantInt::get(I64, len)), Body, Exit);
+  B.SetInsertPoint(Body);
+  Value *bb = B.CreateLoad(I8, B.CreateGEP(I8, anchor, iv));
+  Value *h = B.CreateMul(B.CreateXor(B.CreateLoad(I32, H), B.CreateZExt(bb, I32)),
+                         ConstantInt::get(I32, 16777619u));  // FNV-1a-32 prime
+  B.CreateStore(h, H);
+  B.CreateStore(B.CreateAdd(iv, ConstantInt::get(I64, 1)), I);
+  B.CreateBr(Cond);
+  B.SetInsertPoint(Exit);
+  B.CreateStore(B.CreateLoad(I32, H), ae.marker)->setVolatile(true);
+  B.CreateRetVoid();
+  appendToGlobalCtors(M, C, 0);
+}
+
 // Eager mode: one global constructor that decrypts all the given strings before main().
 void emitStartupCtor(Module &M, Function *Helper, ArrayRef<EncTarget> targets, const AntiEmu *ae) {
   LLVMContext &Ctx = M.getContext();
@@ -299,8 +337,30 @@ PreservedAnalyses StrEncPass::run(Module &M, ModuleAnalysisManager &) {
   // deobfuscator that emulates the decryptor in isolation (without running constructors) recovers
   // garbage. Default off; it does not affect a real run.
   AntiEmu ae_storage, *ae = nullptr;
-  if (std::getenv("RUSTCLOAK_ANTIEMU")) {
-    Type *I32 = Type::getInt32Ty(Ctx);
+  Type *I32 = Type::getInt32Ty(Ctx);
+  if (std::getenv("RUSTCLOAK_STRENC_SELFKEY") && !targets.empty()) {
+    // Derive the key marker at run time from a hash of the ciphertext, so static recovery must
+    // execute the hash rather than read a constant (see emitComputedMarkerCtor). The anchor is the
+    // first encrypted string; its ciphertext bytes are known here, so magic is computed to match.
+    GlobalVariable *anchor = targets.front().G;
+    uint64_t alen = targets.front().len;
+    Constant *init = anchor->getInitializer();
+    auto *cda = dyn_cast<ConstantDataArray>(init);
+    if (!cda)
+      if (auto *cs = dyn_cast<ConstantStruct>(init))
+        cda = dyn_cast<ConstantDataArray>(cs->getOperand(0));
+    StringRef ct = cda->getRawDataValues();
+    uint32_t magic = 2166136261u;
+    for (unsigned char b : ct) {
+      magic ^= b;
+      magic *= 16777619u;
+    }
+    ae_storage.magic = magic;
+    ae_storage.marker = new GlobalVariable(M, I32, /*isConstant=*/false, GlobalValue::InternalLinkage,
+                                           ConstantInt::get(I32, 0), rustcloak::anon("mkv"));
+    emitComputedMarkerCtor(M, ae_storage, anchor, alen);
+    ae = &ae_storage;
+  } else if (std::getenv("RUSTCLOAK_ANTIEMU")) {
     ae_storage.magic = (uint32_t)gen() | 1u;
     ae_storage.marker = new GlobalVariable(M, I32, /*isConstant=*/false, GlobalValue::InternalLinkage,
                                            ConstantInt::get(I32, 0), rustcloak::anon("mkv"));
