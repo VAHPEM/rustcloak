@@ -82,7 +82,11 @@ Each transform lives in its own source file and can be used alone or together.
    are mixed per block (the seed picks one), each proven always-true over all 32-bit inputs with z3,
    so a deobfuscator cannot pattern-match a single shape: `(x·(x+1)) & 1 == 0`, `(x² + x) & 1 == 0`,
    `(x² ^ x) & 1 == 0`, `(x | 1) & 1 == 1`, and `(x&1)·(x&1) == (x&1)`. Each guarded block gains a
-   fake alternate path that never executes but clutters the control-flow graph.
+   fake alternate path that never executes but clutters the control-flow graph. That fake path no
+   longer stores to a dedicated sink global (a one-line grep/YARA signature) — it computes a
+   **realistic hash/mix-shaped value from a live in-scope value and feeds it back into the flow
+   through a PHI** the tail reads, anchored by a volatile *read* of module state so the optimizer
+   keeps the branch rather than speculating it into a select.
 
    **Two-way opaque predicates (`RUSTCLOAK_BOGUS_TWOWAY=1`).** The one-way form above has a dead arm a
    prover can prune once it shows the predicate constant. The two-way form has *no dead arm*: it

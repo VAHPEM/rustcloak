@@ -51,12 +51,14 @@ echo "========================= DIFFICULTY ========================="
 # virt: opcode entropy / handlers
 pass_ll "" VM
 echo -n "virt   : "; python3 "$HERE/opcode_entropy.py" /tmp/t.ll
-# bogus: opaque junk-block fold survival
+# bogus: opaque-predicate CFG clutter and its survival of a simplifycfg pass (the junk arm now
+# feeds the dataflow through a PHI instead of a volatile store-to-sink, so the signal is branches).
 pass_ll "" "function(bogus)"
-b1=$(grep -c 'store volatile' /tmp/t.ll || true)
-$OPT -O2 /tmp/t.ll -S -o /tmp/t2.ll 2>/dev/null
-b2=$(grep -c 'store volatile' /tmp/t2.ll || true)
-echo "bogus  : opaque junk-blocks emitted=$b1  surviving opt -O2=$b2  (higher survival = harder to fold)"
+b1=$(grep -c 'br i1' /tmp/t.ll || true)
+$OPT -passes=simplifycfg /tmp/t.ll -S -o /tmp/t2.ll 2>/dev/null
+b2=$(grep -c 'br i1' /tmp/t2.ll || true)
+sink=$(grep -c 'store volatile' /tmp/t.ll || true)
+echo "bogus  : conditional branches=$b1  surviving simplifycfg=$b2  volatile-store-to-sink=$sink (0 = no signature)"
 # subst: MBA expansion
 before=$(grep -cE '= (add|sub|mul|and|or|xor) i(8|16|32|64)' /tmp/m.ll || true)
 pass_ll "" "function(subst)"

@@ -81,6 +81,24 @@ Value *realSeed(IRBuilder<> &B, Function *F) {
   return nullptr;
 }
 
+// An integer value (width >= 2) defined in `head` or an argument, and USED in `tail`. Such a value
+// can be routed through a diamond -- its uses in the tail redirected to a PHI -- so an injected arm
+// produces a value that genuinely feeds the program's dataflow (not a dead sink). null if none.
+Value *liveIntUsedIn(BasicBlock *head, BasicBlock *tail) {
+  for (Instruction &I : *tail)
+    for (Value *op : I.operands()) {
+      if (auto *vi = dyn_cast<Instruction>(op)) {
+        if (vi->getParent() == head && vi->getType()->isIntegerTy() &&
+            vi->getType()->getIntegerBitWidth() >= 2)
+          return vi;
+      } else if (auto *arg = dyn_cast<Argument>(op)) {
+        if (arg->getType()->isIntegerTy() && arg->getType()->getIntegerBitWidth() >= 2)
+          return arg;
+      }
+    }
+  return nullptr;
+}
+
 bool bogusBlock(BasicBlock *BB, Module &M, std::mt19937_64 &gen) {
   if (BB->isEHPad() || isa<PHINode>(BB->getTerminator()))
     return false;
@@ -108,16 +126,47 @@ bool bogusBlock(BasicBlock *BB, Module &M, std::mt19937_64 &gen) {
     x = B.CreateLoad(Type::getInt32Ty(M.getContext()), internalI32(M, rustcloak::anon("ox")), "");
   Value *cond = opaqueTrueFrom(B, x, gen);
 
+  Type *I32 = Type::getInt32Ty(M.getContext());
   BasicBlock *bogus = BasicBlock::Create(M.getContext(), "", BB->getParent(), tail);
   IRBuilder<> BB2(bogus);
-  // junk that cannot be trivially removed: a volatile store to a sink global.
-  Type *I32 = Type::getInt32Ty(M.getContext());
-  Value *jx = BB2.CreateLoad(I32, internalI32(M, rustcloak::anon("ox")));
-  Value *junk = BB2.CreateXor(BB2.CreateMul(jx, ConstantInt::get(I32, (uint32_t)(gen() | 1))),
-                              ConstantInt::get(I32, (uint32_t)gen()));
-  BB2.CreateStore(junk, internalI32(M, rustcloak::anon("sink")))->setVolatile(true);
-  BB2.CreateBr(tail);               // tail has no PHIs (split mid-block), so this is safe
+  // A volatile READ of module state anchors the bogus block (a real side effect, so it is not
+  // speculated into a select and the CFG stays cluttered) -- not a volatile store to a dedicated
+  // sink, which is a one-line grep/YARA signature.
+  LoadInst *rd = BB2.CreateLoad(I32, internalI32(M, rustcloak::anon("ox")));
+  rd->setVolatile(true);
 
+  // Prefer REALISTIC junk: compute a hash/mix-shaped value from a live in-scope value and feed it
+  // back into the flow through a PHI the tail uses, so the bogus arm looks like ordinary program
+  // computation rather than an obvious dead store. (The arm never executes -- the predicate is
+  // always true -- so the value is free to differ from the real one.)
+  Value *v = liveIntUsedIn(BB, tail);
+  if (v) {
+    Type *ty = v->getType();
+    auto C = [&](uint64_t k) { return ConstantInt::get(ty, k); };
+    Value *anchor = BB2.CreateZExtOrTrunc(BB2.CreateAnd(rd, ConstantInt::get(I32, 0)), ty); // == 0
+    Value *vj = BB2.CreateXor(BB2.CreateMul(v, C(gen() | 1u)), BB2.CreateLShr(v, C(3)));
+    vj = BB2.CreateAdd(BB2.CreateAdd(vj, C(gen())), anchor);  // hash-step shape, anchored
+    BB2.CreateBr(tail);
+    BranchInst::Create(tail, bogus, cond, term);
+    term->eraseFromParent();
+    // route it back: tail uses of v now read a PHI fed by the real value (taken edge) and the junk.
+    PHINode *vp = PHINode::Create(ty, 2, "", &*tail->getFirstInsertionPt());
+    vp->addIncoming(v, BB);
+    vp->addIncoming(vj, bogus);
+    for (Instruction &I : *tail)
+      if (&I != vp)
+        for (Use &U : I.operands())
+          if (U.get() == v)
+            U.set(vp);
+    return true;
+  }
+
+  // Fallback (no routable value in scope): a store-free junk computation anchored by the volatile
+  // read, into a module-internal global that looks like ordinary state -- still no dedicated sink.
+  Value *junk = BB2.CreateXor(BB2.CreateMul(rd, ConstantInt::get(I32, (uint32_t)(gen() | 1))),
+                              ConstantInt::get(I32, (uint32_t)gen()));
+  BB2.CreateStore(junk, internalI32(M, rustcloak::anon("st")));
+  BB2.CreateBr(tail);
   BranchInst::Create(tail, bogus, cond, term);
   term->eraseFromParent();
   return true;
@@ -147,18 +196,7 @@ bool twoWayBlock(BasicBlock *BB, Module &M, std::mt19937_64 &gen) {
   BasicBlock *tail = BB->splitBasicBlock(split, "");
   // A live integer value defined in the head (or an argument) and used in the tail: routing it
   // through the diamond gives the arms a real, used result, so nothing is dead code.
-  Value *v = nullptr;
-  for (Instruction &I : *tail) {
-    for (Value *op : I.operands()) {
-      if (auto *vi = dyn_cast<Instruction>(op)) {
-        if (vi->getParent() == BB && vi->getType()->isIntegerTy() &&
-            vi->getType()->getIntegerBitWidth() >= 2) { v = vi; break; }
-      } else if (auto *arg = dyn_cast<Argument>(op)) {
-        if (arg->getType()->isIntegerTy() && arg->getType()->getIntegerBitWidth() >= 2) { v = arg; break; }
-      }
-    }
-    if (v) break;
-  }
+  Value *v = liveIntUsedIn(BB, tail);
   if (!v)
     return false;                      // nothing to route -> leave the plain split (still correct)
 
