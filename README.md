@@ -64,11 +64,17 @@ Each transform lives in its own source file and can be used alone or together.
    data. It also ties the key to the exact ciphertext, so editing the encrypted bytes changes the
    marker and corrupts every string (`test/selfkey.sh`).
 
-3. **Instruction substitution — `subst` (`src/Subst.cpp`).** Replaces arithmetic/logic with
-   **mixed boolean-arithmetic (MBA)** expressions, each proven equivalent for all inputs with z3 —
-   `a + b` → `(a ^ b) + 2·(a & b)`, `a - b` → `(a ^ b) − 2·(~a & b)`, `a ^ b` → `(a | b) − (a & b)`,
-   `a & b` → `(a | b) − (a ^ b)`, `a | b` → `(a & b) + (a ^ b)` — mixing arithmetic and bitwise ops so
-   the operation is far less obvious and resists simple pattern reversal.
+3. **Instruction substitution — `subst` (`src/Subst.cpp`).** Replaces arithmetic/logic with longer
+   equivalent expressions, in two equivalence-preserving layers. First, **mixed boolean-arithmetic
+   (MBA)** identities — now *several per operator*, chosen by seed so no single pattern matches every
+   rewrite: `a + b` → `(a^b)+2(a&b)` or `(a|b)+(a&b)`; `a ^ b` → `(a|b)−(a&b)` or `(a|b)&~(a&b)`;
+   `a & b` → `(a|b)−(a^b)` or `a&~(a&~b)`; `a | b` → `(a&b)+(a^b)` or `a+b−(a&b)`; and the `a − b`
+   duals. Second, an invertible **affine (permutation-polynomial) encoding** of add/sub: a per-op odd
+   constant `A` and its modular inverse give `a + b = A⁻¹·(A·a + A·b) (mod 2^w)`, so the operation is
+   carried out in an encoded domain a simplifier (arybo/SSPAM) must invert. `RUSTCLOAK_SUBST_DEPTH=N`
+   (default 1, capped at 4) re-applies the rewrite N times — operators created in one round are
+   rewritten in the next, so expressions nest to depth N (measured expansion ≈ 3× at depth 1, ≈ 20× at
+   depth 3), and the nesting breaks up the clean affine pattern so it is not trivially folded back.
 
 4. **Bogus control flow + opaque predicates — `bogus` (`src/Bogus.cpp`).** Splits blocks and guards
    the real path with an **opaque predicate** — a condition that is always true but that the compiler
@@ -206,6 +212,7 @@ opt-18 -load-pass-plugin=build/libRustCloak.so -passes='strenc,function(subst,bo
 
 # Build-time flags (environment variables, so they work through clang and rustc alike):
 #   RUSTCLOAK_SEED=N     reproducible build (default: random per build)
+#   RUSTCLOAK_SUBST_DEPTH=N  apply MBA substitution N times (1..4); deeper = larger expressions
 #   RUSTCLOAK_LAZY=1     decrypt each string on first use, not all at startup
 #   RUSTCLOAK_ANTIEMU=1  bind string keys to a loader-set marker (defeats isolated emulation)
 #   RUSTCLOAK_STRENC_SELFKEY=1  derive that marker by hashing the ciphertext (key is never a constant)
