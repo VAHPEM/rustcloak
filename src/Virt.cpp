@@ -37,6 +37,7 @@
 #include "llvm/IR/Instructions.h"
 #include "llvm/IR/Module.h"
 #include "llvm/Transforms/Utils/BasicBlockUtils.h"
+#include "llvm/Transforms/Utils/Cloning.h"
 
 #include <algorithm>
 #include <array>
@@ -154,8 +155,8 @@ static bool eligible(Function &F) {
     Instruction *term = BB.getTerminator();
     if (auto *ret = dyn_cast<ReturnInst>(term)) {
       Value *rv = ret->getReturnValue();
-      if (rv && !(rv->getType()->isIntegerTy() && rv->getType()->getIntegerBitWidth() <= 64))
-        return false;                    // int or void return only (no pointer returns yet)
+      if (rv && !isRegTy(rv->getType()))
+        return false;                    // int<=64, pointer, or void return
     } else if (!isa<BranchInst>(term)) {
       return false;
     }
@@ -228,21 +229,98 @@ static bool eligible(Function &F) {
   return true;
 }
 
+// Selective inter-function virtualization (RUSTCLOAK_VM_INLINE): inline small, internal, leaf,
+// virt-eligible callees into F before it is virtualized, so their operations become part of F's
+// bytecode and the call boundary disappears. Sound (InlineFunction preserves semantics) and
+// bounded (leaf-only -> no recursion, size-capped, fixed inline budget).
+static void inlineTinyCallees(Function &F) {
+  unsigned budget = 8;
+  bool changed = true;
+  while (changed && budget) {
+    changed = false;
+    for (BasicBlock &BB : F) {
+      for (Instruction &I : BB) {
+        auto *ci = dyn_cast<CallInst>(&I);
+        if (!ci || ci->isInlineAsm())
+          continue;
+        Function *cal = ci->getCalledFunction();
+        if (!cal || cal == &F || cal->isDeclaration() || cal->isVarArg())
+          continue;
+        if (!cal->hasInternalLinkage() && !cal->hasPrivateLinkage())
+          continue;
+        unsigned ninst = 0;
+        bool leaf = true;
+        for (BasicBlock &CB : *cal)
+          for (Instruction &CI : CB) {
+            ninst++;
+            if (isa<CallInst>(CI) || isa<InvokeInst>(CI))
+              leaf = false;               // leaf only: no recursion, no call chains
+          }
+        if (!leaf || ninst > 30 || !eligible(*cal))
+          continue;
+        InlineFunctionInfo IFI;
+        if (InlineFunction(*ci, IFI).isSuccess()) {
+          changed = true;
+          --budget;
+        }
+        break;                            // inlining invalidated the iterators; rescan
+      }
+      if (changed)
+        break;
+    }
+  }
+}
+
 } // namespace
 
 PreservedAnalyses VirtPass::run(Function &F, FunctionAnalysisManager &) {
   if (!getenv("RUSTCLOAK_VM"))
     return PreservedAnalyses::all();
+  if (getenv("RUSTCLOAK_VM_INLINE"))
+    inlineTinyCallees(F);                // fold tiny leaf callees in before virtualizing
   if (!eligible(F))
     return PreservedAnalyses::all();
 
-  // Per-build, per-function opcode encoding: the logical opcode -> byte mapping is a seeded random
-  // permutation of the low 6 bits, so two builds (or two functions) share no VM instruction set and
-  // a deobfuscator cannot assume fixed opcode numbers -- it must recover the map from the handlers.
-  // The width still rides in the top two bits.
-  std::array<uint8_t, 64> enc;           // enc[logical base] = emitted byte-base
-  std::iota(enc.begin(), enc.end(), 0);
-  std::shuffle(enc.begin(), enc.end(), rustcloak::rng(("vmenc:" + F.getName()).str()));
+  // Per-build, per-function opcode encoding with SYNONYMS. The low 6 bits of the opcode byte are a
+  // slot; each logical base owns one or more slots (frequent ops own several), and emit() picks a
+  // random slot of the op each time -- so no single byte dominates a frequency count and an analyst
+  // cannot tag "the most common opcode" as ADD. `dec` maps every slot back to its logical base; the
+  // width still rides in the top two bits. The layout is seeded, so two builds (or two functions)
+  // share no instruction set.
+  std::mt19937_64 encRng = rustcloak::rng(("vmenc:" + F.getName()).str());
+  const unsigned NBASE = OP_CALL + 1;    // logical bases 0..OP_CALL
+  auto weightOf = [](unsigned b) -> unsigned {
+    switch (b) {
+    case OP_MOV: case OP_CONST: case OP_ADD: case OP_SUB:
+    case OP_XOR: case OP_AND: case OP_OR: case OP_LOAD: case OP_STORE: return 3;
+    default: return 1;
+    }
+  };
+  std::vector<uint8_t> assign;           // slot -> logical base; every base appears at least once
+  for (unsigned b = 0; b < NBASE; b++)
+    assign.push_back((uint8_t)b);
+  std::vector<uint8_t> extra;            // weighted extra synonym slots for the frequent ops
+  for (unsigned b = 0; b < NBASE; b++)
+    for (unsigned w = 1; w < weightOf(b); w++)
+      extra.push_back((uint8_t)b);
+  std::shuffle(extra.begin(), extra.end(), encRng);
+  for (uint8_t b : extra) {
+    if (assign.size() >= 64) break;
+    assign.push_back(b);
+  }
+  while (assign.size() < 64)             // pad any remaining slots with random synonyms
+    assign.push_back((uint8_t)(encRng() % NBASE));
+  std::shuffle(assign.begin(), assign.end(), encRng);
+  std::array<uint8_t, 64> dec;           // slot -> logical base
+  std::array<std::vector<uint8_t>, 64> syn;   // logical base -> its slots
+  for (unsigned s = 0; s < 64; s++) {
+    dec[s] = assign[s];
+    syn[assign[s]].push_back((uint8_t)s);
+  }
+  auto pickSlot = [&](uint8_t base) -> uint8_t {
+    auto &v = syn[base];
+    return v[encRng() % v.size()];
+  };
   // the three operand bytes (dst, a, b) are XOR-encrypted with a per-build/per-function key, so the
   // whole 4-byte instruction -- not just the opcode -- is build-specific; the interpreter decrypts
   // each operand after fetch. (Register indices, pool indices and branch targets are all hidden.)
@@ -349,7 +427,7 @@ PreservedAnalyses VirtPass::run(Function &F, FunctionAnalysisManager &) {
   std::vector<VI> code;
   auto emit = [&](uint8_t base, unsigned width, unsigned dst, unsigned a, unsigned b,
                   BasicBlock *tgt = nullptr) {
-    code.push_back(VI{(uint8_t)(enc[base] | (wcodeOf(width) << 6)), (uint8_t)dst,
+    code.push_back(VI{(uint8_t)(pickSlot(base) | (wcodeOf(width) << 6)), (uint8_t)dst,
                       (uint8_t)a, (uint8_t)b, tgt});
   };
   for (auto &kv : P.creg)
@@ -579,9 +657,6 @@ PreservedAnalyses VirtPass::run(Function &F, FunctionAnalysisManager &) {
     B.CreateBr(loop);
   };
 
-  std::array<uint8_t, 64> dec;           // invert the opcode encoding for handler generation
-  for (unsigned i = 0; i < 64; i++)
-    dec[enc[i]] = (uint8_t)i;
   static const unsigned WBITS[4] = {8, 16, 32, 64};
   for (unsigned ob : present) {
     uint8_t base = dec[ob & 0x3f];
@@ -594,7 +669,9 @@ PreservedAnalyses VirtPass::run(Function &F, FunctionAnalysisManager &) {
     if (base == OP_RETV) { B.CreateRetVoid(); continue; }
     if (base == OP_RET) {
       Value *v = loadReg(ra);
-      if (retTy->isIntegerTy() && retTy->getIntegerBitWidth() < 64)
+      if (retTy->isPointerTy())
+        v = B.CreateIntToPtr(v, retTy);   // the lane holds the address; hand back a pointer
+      else if (retTy->isIntegerTy() && retTy->getIntegerBitWidth() < 64)
         v = B.CreateTrunc(v, retTy);
       B.CreateRet(v);
       continue;

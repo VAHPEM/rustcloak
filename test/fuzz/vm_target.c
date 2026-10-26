@@ -48,6 +48,11 @@ __attribute__((noinline)) static uint32_t caller(uint32_t x, uint32_t y) {
     return (uint32_t)narrow_ret(x) + (uint32_t)narrow_ret(y) * 3u;
 }
 
+// pointer return: the VM must hand back an address (inttoptr); the caller then dereferences it.
+__attribute__((noinline)) static const uint32_t *pick_ptr(const uint32_t *a, uint32_t i) {
+    return &a[i & 7u];
+}
+
 __attribute__((noinline)) static uint32_t mix(uint32_t x, uint32_t y) {
     uint32_t a = (x ^ 0x9e3779b9u) + (y << 7);
     uint32_t b = (a * 0x85ebca6bu) ^ (a >> 13);
@@ -64,6 +69,7 @@ uint64_t compute(const uint8_t *data, size_t len) {
         uint32_t p[8];
         for (int j = 0; j < 8; j++) p[j] = (uint32_t)(x >> j) + j;
         acc ^= arr_pick(p);
+        acc += *pick_ptr(p, (uint32_t)x);     // pointer-return path
         uint8_t buf[16], out[16], key[4];
         for (int j = 0; j < 16; j++) buf[j] = (uint8_t)(x >> (j & 7)) + j;
         for (int j = 0; j < 4;  j++) key[j] = data[(i + (size_t)j) % len];
