@@ -5,6 +5,7 @@
 # Uses libFuzzer (coverage-guided) when the clang runtime is present; otherwise a standalone
 # random driver. Works on x86-64 and AArch64.
 set -uo pipefail
+export RUSTCLOAK_SEED=${RUSTCLOAK_SEED:-0x51ab1ec0de}   # fixed seed: reproducible obfuscation
 HERE="$(cd "$(dirname "$0")" && pwd)"
 PLUGIN=${PLUGIN:-$HERE/../../build/libRustCloak.so}
 CLANG=${CLANG:-clang-18}

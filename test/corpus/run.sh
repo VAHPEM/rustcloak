@@ -9,6 +9,7 @@
 # (c_loops.c); C++ exceptions + virtual dispatch (cpp_classes.cpp); Rust enums/iterators/HashMap
 # (rust_prog.rs).
 set -uo pipefail
+export RUSTCLOAK_SEED=${RUSTCLOAK_SEED:-0x51ab1ec0de}   # fixed seed: reproducible obfuscation
 HERE="$(cd "$(dirname "$0")" && pwd)"
 PLUGIN=${PLUGIN:-/home/claude/rustcloak/build/libRustCloak.so}
 [ -f "$PLUGIN" ] || PLUGIN="$HERE/../build/libRustCloak.so"
