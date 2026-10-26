@@ -35,14 +35,14 @@ GlobalVariable *internalI32(Module &M, StringRef name) {
   return G;
 }
 
-// An always-true i1 the optimizer cannot fold, computed from a non-constant global x. Several
-// families are mixed per block (chosen by the seed) so a deobfuscator cannot pattern-match one
-// shape; each is proven always-true over all 32-bit inputs (mod 2^32) with z3 -- they reduce to a
-// parity identity: x^2 == x (mod 2), x(x+1) even, x|1 odd, or b*b == b for b in {0,1}.
-Value *opaqueTrue(IRBuilder<> &B, Module &M, std::mt19937_64 &gen) {
-  Type *I32 = Type::getInt32Ty(M.getContext());
-  Value *x = B.CreateLoad(I32, internalI32(M, rustcloak::anon("ox")), "");
-  Constant *zero = ConstantInt::get(I32, 0), *one = ConstantInt::get(I32, 1);
+// An always-true i1 computed from a REAL in-scope 32-bit value x. Because x is actual program data
+// (not a constant), the optimizer cannot fold the predicate -- it does not know x's value, and the
+// relevant invariants (e.g. x and x+1 have opposite parity) are correlations KnownBits does not
+// track -- and an analyst must reason about the function's own dataflow to see it is always true.
+// Several families are mixed per block (seed-chosen) so no single shape can be pattern-matched;
+// each reduces to a parity identity true for every 32-bit x (verified with z3).
+Value *opaqueTrueFrom(IRBuilder<> &B, Value *x, std::mt19937_64 &gen) {
+  Value *zero = B.getInt32(0), *one = B.getInt32(1);
   switch (gen() % 5) {
   case 0: {                               // (x*(x+1)) & 1 == 0
     Value *p = B.CreateMul(x, B.CreateAdd(x, one));
@@ -56,15 +56,29 @@ Value *opaqueTrue(IRBuilder<> &B, Module &M, std::mt19937_64 &gen) {
     Value *p = B.CreateXor(B.CreateMul(x, x), x);
     return B.CreateICmpEQ(B.CreateAnd(p, one), zero, "");
   }
-  case 3: {                               // (x | 1) & 1 == 1
-    Value *p = B.CreateOr(x, one);
+  case 3: {                               // consecutive ints differ in the low bit: (x ^ (x+1)) & 1 == 1
+    Value *p = B.CreateXor(x, B.CreateAdd(x, one));
     return B.CreateICmpEQ(B.CreateAnd(p, one), one, "");
   }
-  default: {                              // (x&1)*(x&1) == (x&1)
-    Value *b = B.CreateAnd(x, one);
-    return B.CreateICmpEQ(B.CreateMul(b, b), b, "");
+  default: {                              // x*(x-1) is even (two consecutive integers)
+    Value *p = B.CreateMul(x, B.CreateSub(x, one));
+    return B.CreateICmpEQ(B.CreateAnd(p, one), zero, "");
   }
   }
+}
+
+// A real, dominating i32 to seed the predicate: an integer function argument (arguments dominate
+// every instruction in the function), narrowed/widened to i32. Returns nullptr when the function
+// has no integer argument, so the caller can fall back to the module-internal global.
+Value *realSeed(IRBuilder<> &B, Function *F) {
+  for (Argument &A : F->args())
+    if (A.getType()->isIntegerTy()) {
+      unsigned w = A.getType()->getIntegerBitWidth();
+      if (w == 32) return &A;
+      if (w > 32)  return B.CreateTrunc(&A, B.getInt32Ty());
+      return B.CreateZExt(&A, B.getInt32Ty());
+    }
+  return nullptr;
 }
 
 bool bogusBlock(BasicBlock *BB, Module &M, std::mt19937_64 &gen) {
@@ -87,14 +101,19 @@ bool bogusBlock(BasicBlock *BB, Module &M, std::mt19937_64 &gen) {
   // BB now ends in `br tail`; replace with an opaque-guarded branch to tail or bogus.
   Instruction *term = BB->getTerminator();
   IRBuilder<> B(term);
-  Value *cond = opaqueTrue(B, M, gen);
+  // Seed the opaque predicate from a real in-scope value when one exists (unfoldable, tied to the
+  // function's own data); otherwise fall back to the module-internal global.
+  Value *x = realSeed(B, BB->getParent());
+  if (!x)
+    x = B.CreateLoad(Type::getInt32Ty(M.getContext()), internalI32(M, rustcloak::anon("ox")), "");
+  Value *cond = opaqueTrueFrom(B, x, gen);
 
   BasicBlock *bogus = BasicBlock::Create(M.getContext(), "", BB->getParent(), tail);
   IRBuilder<> BB2(bogus);
   // junk that cannot be trivially removed: a volatile store to a sink global.
   Type *I32 = Type::getInt32Ty(M.getContext());
-  Value *x = BB2.CreateLoad(I32, internalI32(M, rustcloak::anon("ox")));
-  Value *junk = BB2.CreateXor(BB2.CreateMul(x, ConstantInt::get(I32, (uint32_t)(gen() | 1))),
+  Value *jx = BB2.CreateLoad(I32, internalI32(M, rustcloak::anon("ox")));
+  Value *junk = BB2.CreateXor(BB2.CreateMul(jx, ConstantInt::get(I32, (uint32_t)(gen() | 1))),
                               ConstantInt::get(I32, (uint32_t)gen()));
   BB2.CreateStore(junk, internalI32(M, rustcloak::anon("sink")))->setVolatile(true);
   BB2.CreateBr(tail);               // tail has no PHIs (split mid-block), so this is safe
