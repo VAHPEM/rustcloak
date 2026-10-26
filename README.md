@@ -250,6 +250,10 @@ RUSTCLOAK_NIGHTLY=nightly-2024-06-15 ./test/rust_demo.sh   # Rust: -Zllvm-plugin
 ./test/difftest.sh                             # behaviour: obfuscated == baseline (+ virt fuzz)
 ./test/matrix.sh                               # the whole matrix: ELF x64/ARM64 + Windows PE
 ./test/measure.sh                              # strength/cost per transform
+./test/diversity.sh                            # same seed reproduces; different seeds diverge
+./test/tamper.sh                               # VM integrity: every bytecode byte-flip is caught
+./test/nest.sh                                 # nested VM-in-VM engages and stays correct
+./test/select.sh ./test/selfkey.sh ./test/twoway.sh   # selective VM / runtime key / two-way bogus
 ```
 
 Both of the first two scripts are architecture-agnostic (set `RUSTCLOAK_TARGET=<triple>`, e.g.
