@@ -256,6 +256,11 @@ PreservedAnalyses StrEncPass::run(Module &M, ModuleAnalysisManager &) {
       continue;
     if (G.getName().starts_with("llvm."))
       continue;
+    // Globals in the llvm.metadata section (e.g. the strings behind __attribute__((annotate(...))),
+    // kept alive by @llvm.global.annotations but never emitted) must not be rewritten: encrypting
+    // them adds a decrypt reference to a symbol codegen drops, giving "Undefined temporary symbol".
+    if (G.getSection() == "llvm.metadata")
+      continue;
     // C strings are a bare `[N x i8]`; Rust wraps them in a one-field struct
     // `<{ [N x i8] }>`. Unwrap the single-element aggregate to find the i8 array.
     Constant *init = G.getInitializer();

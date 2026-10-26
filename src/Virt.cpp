@@ -30,6 +30,7 @@
 #include "RustCloak.h"
 
 #include "llvm/ADT/DenseMap.h"
+#include "llvm/IR/Constants.h"
 #include "llvm/IR/DataLayout.h"
 #include "llvm/IR/Function.h"
 #include "llvm/IR/GetElementPtrTypeIterator.h"
@@ -41,8 +42,10 @@
 
 #include <algorithm>
 #include <array>
+#include <cctype>
 #include <cstdlib>
 #include <numeric>
+#include <string>
 #include <vector>
 
 using namespace llvm;
@@ -143,6 +146,97 @@ static Function *virtCallee(CallInst *ci) {
   if (rt->isIntegerTy() && stdWidth(rt->getIntegerBitWidth()))
     return callee;
   return nullptr;
+}
+
+// ---- selective virtualization --------------------------------------------------------------
+// Virtualization is the strongest transform but also the most expensive (~an order of magnitude
+// slower for the virtualized function). Applying it to EVERY eligible function therefore taxes the
+// whole program for protection only a few sensitive routines (licence checks, crypto, key schedules)
+// actually need. Selective mode scopes the VM to where it matters:
+//
+//   default (RUSTCLOAK_VM=1)      every eligible function (unchanged behaviour)
+//   RUSTCLOAK_VM_SELECTIVE=1      only functions whose name looks sensitive (heuristic below)
+//   RUSTCLOAK_VM_ONLY=a,b,...     only functions whose name contains one of these substrings
+//   RUSTCLOAK_VM_SKIP=a,b,...     never these (a denylist; applies in every mode)
+//   __attribute__((annotate("rustcloak_vm")))  force-virtualize this function in any mode
+//   RUSTCLOAK_VM_RATIO=P          of those otherwise chosen, keep a seeded ~P% (0..100)
+static std::vector<std::string> splitList(const char *e) {
+  std::vector<std::string> out;
+  if (!e) return out;
+  std::string s(e), cur;
+  for (char c : s) {
+    if (c == ',') { if (!cur.empty()) out.push_back(cur); cur.clear(); }
+    else cur += (char)std::tolower((unsigned char)c);
+  }
+  if (!cur.empty()) out.push_back(cur);
+  return out;
+}
+static bool containsAny(StringRef name, const std::vector<std::string> &pats) {
+  std::string lo = name.lower();
+  for (const std::string &p : pats)
+    if (lo.find(p) != std::string::npos)
+      return true;
+  return false;
+}
+// Name heuristic: substrings common to security-sensitive routines. Matched case-insensitively on
+// the (possibly mangled) symbol name, so `license_check`, `aes_encrypt`, `keyschedule` all hit.
+static bool sensitiveName(StringRef name) {
+  static const std::vector<std::string> kw = {
+    "check", "verif", "valid", "licen", "crypt", "cipher", "encrypt", "decrypt", "key",
+    "hash", "auth", "sign", "secret", "token", "passw", "serial", "schedule", "mac", "hmac"};
+  return containsAny(name, kw);
+}
+// A function carries __attribute__((annotate("want"))) when @llvm.global.annotations has an entry
+// whose first field is this function and whose string field equals `want`.
+static bool hasFnAnnotation(Function &F, StringRef want) {
+  GlobalVariable *GA = F.getParent()->getGlobalVariable("llvm.global.annotations");
+  if (!GA || !GA->hasInitializer())
+    return false;
+  auto *arr = dyn_cast<ConstantArray>(GA->getInitializer());
+  if (!arr)
+    return false;
+  for (Value *op : arr->operands()) {
+    auto *cs = dyn_cast<ConstantStruct>(op);
+    if (!cs || cs->getNumOperands() < 2)
+      continue;
+    if (cs->getOperand(0)->stripPointerCasts() != &F)
+      continue;
+    auto *strGV = dyn_cast<GlobalVariable>(cs->getOperand(1)->stripPointerCasts());
+    if (!strGV || !strGV->hasInitializer())
+      continue;
+    if (auto *cda = dyn_cast<ConstantDataArray>(strGV->getInitializer()))
+      if (cda->isCString() && cda->getAsCString() == want)
+        return true;
+  }
+  return false;
+}
+static bool selectedForVirt(Function &F) {
+  StringRef name = F.getName();
+  static const std::vector<std::string> skip = splitList(std::getenv("RUSTCLOAK_VM_SKIP"));
+  static const std::vector<std::string> only = splitList(std::getenv("RUSTCLOAK_VM_ONLY"));
+  static const bool selective = std::getenv("RUSTCLOAK_VM_SELECTIVE") != nullptr;
+  static const int ratio = []() {
+    const char *e = std::getenv("RUSTCLOAK_VM_RATIO");
+    return e ? std::atoi(e) : 100;
+  }();
+
+  if (containsAny(name, skip))
+    return false;                          // denylist always wins
+  if (hasFnAnnotation(F, "rustcloak_vm"))
+    return true;                           // explicit opt-in bypasses selective/only/ratio
+  bool pick;
+  if (!only.empty())
+    pick = containsAny(name, only);        // allowlist mode
+  else if (selective)
+    pick = sensitiveName(name);            // heuristic mode
+  else
+    pick = true;                           // default: every eligible function
+  if (!pick)
+    return false;
+  if (ratio < 100)                         // seeded thinning, reproducible for a fixed seed
+    if ((int)(rustcloak::rng(("vmratio:" + name.str()))() % 100) >= ratio)
+      return false;
+  return true;
 }
 
 static bool eligible(Function &F) {
@@ -275,6 +369,8 @@ static void inlineTinyCallees(Function &F) {
 
 PreservedAnalyses VirtPass::run(Function &F, FunctionAnalysisManager &) {
   if (!getenv("RUSTCLOAK_VM"))
+    return PreservedAnalyses::all();
+  if (!selectedForVirt(F))               // selective/partial scoping (see selectedForVirt)
     return PreservedAnalyses::all();
   if (getenv("RUSTCLOAK_VM_INLINE"))
     inlineTinyCallees(F);                // fold tiny leaf callees in before virtualizing

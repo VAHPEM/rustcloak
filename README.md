@@ -101,6 +101,18 @@ Each transform lives in its own source file and can be used alone or together.
    behaviour-identical to native on x86-64, AArch64 and Windows x86-64 over a 20,000-iteration stress
    fold through real buffers, across seeds (each a different opcode map).
 
+   **Selective virtualization.** Virtualization is the strongest transform but also the most
+   expensive, so applying it to every eligible function taxes the whole program for protection only a
+   few routines need. By default `RUSTCLOAK_VM=1` still virtualizes everything eligible; the scope can
+   be narrowed so the VM's cost lands only where it matters: `RUSTCLOAK_VM_SELECTIVE=1` keeps only
+   functions whose name looks security-sensitive (a built-in heuristic — `check`, `licen`, `crypt`,
+   `encrypt`, `key`, `hash`, `auth`, `sign`, `serial`, `schedule`, …); `RUSTCLOAK_VM_ONLY=a,b`
+   restricts to names containing those substrings; `RUSTCLOAK_VM_SKIP=a,b` is a denylist that wins in
+   every mode; `RUSTCLOAK_VM_RATIO=P` keeps a seeded ~P% of the otherwise-chosen set; and
+   `__attribute__((annotate("rustcloak_vm")))` on a function forces it to be virtualized in *any*
+   mode. `test/select.sh` checks each mode virtualizes exactly the intended functions and that
+   behaviour is preserved whatever the selection.
+
    **Anti-tamper bytecode integrity (`RUSTCLOAK_VM_INTEGRITY=1`).** On top of the per-build operand
    encryption, the interpreter can hash *its own bytecode* at run time (FNV-1a-64 over the blob, via
    the same volatile loads it executes) and XOR-fold the result into the operand-decryption keys. For
@@ -166,6 +178,10 @@ opt-18 -load-pass-plugin=build/libRustCloak.so -passes='strenc,function(subst,bo
 #   RUSTCLOAK_LAZY=1     decrypt each string on first use, not all at startup
 #   RUSTCLOAK_ANTIEMU=1  bind string keys to a loader-set marker (defeats isolated emulation)
 #   RUSTCLOAK_VM=1       virtualize eligible functions into custom-bytecode + interpreter
+#   RUSTCLOAK_VM_SELECTIVE=1  virtualize only sensitive-named functions (not every eligible one)
+#   RUSTCLOAK_VM_ONLY=a,b   virtualize only functions whose name contains a or b
+#   RUSTCLOAK_VM_SKIP=a,b   never virtualize functions whose name contains a or b
+#   RUSTCLOAK_VM_RATIO=P    virtualize a seeded ~P% of the otherwise-chosen functions
 #   RUSTCLOAK_VM_INTEGRITY=1  VM self-hashes its bytecode; tampering corrupts the operand keys
 #   RUSTCLOAK_OFF=1      disable all transforms (safety off-switch; emit a normal build)
 ```
