@@ -253,6 +253,7 @@ RUSTCLOAK_NIGHTLY=nightly-2024-06-15 ./test/rust_demo.sh   # Rust: -Zllvm-plugin
 ./test/diversity.sh                            # same seed reproduces; different seeds diverge
 ./test/tamper.sh                               # VM integrity: every bytecode byte-flip is caught
 ./test/nest.sh                                 # nested VM-in-VM engages and stays correct
+./test/combos.sh                               # every flag COMBINATION stays behaviour-correct
 ./test/select.sh ./test/selfkey.sh ./test/twoway.sh   # selective VM / runtime key / two-way bogus
 RUSTDEOBF=../vahpem/rust-deobf ./test/redblue.sh   # run the real deobfuscator; report what it recovers
 ```
