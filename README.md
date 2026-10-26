@@ -164,17 +164,40 @@ Self-checks (behaviour preserved + obfuscation present):
 ```sh
 ./test/build_and_test.sh                       # C: flatten + strenc + -O2 survival
 RUSTCLOAK_NIGHTLY=nightly-2024-06-15 ./test/rust_demo.sh   # Rust: -Zllvm-plugins end to end
+./test/difftest.sh                             # behaviour: obfuscated == baseline (+ virt fuzz)
+./test/matrix.sh                               # the whole matrix: ELF x64/ARM64 + Windows PE
+./test/measure.sh                              # strength/cost per transform
 ```
 
-Both scripts are architecture-agnostic (set `RUSTCLOAK_TARGET=<triple>`, e.g. `aarch64-linux-gnu`,
-to cross-compile instead of building natively). Correctness is checked at the IR level — markers
-the pass injects, which survive `-O2`, and `strings` — not by a disassembly pattern, because the
-dispatcher's machine code differs by arch.
+Both of the first two scripts are architecture-agnostic (set `RUSTCLOAK_TARGET=<triple>`, e.g.
+`aarch64-linux-gnu`, to cross-compile instead of building natively). Correctness is checked at the
+IR level — markers the pass injects, which survive `-O2`, and `strings` — not by a disassembly
+pattern, because the dispatcher's machine code differs by arch.
 
-Verified on **x86-64 and AArch64**: on the C and Rust demos the obfuscated binary produces
-identical output, the secret string is absent from the file, and the control flow is flattened
-(the dispatcher gives every block a random 32-bit state constant). The flattened output is also
-recovered end-to-end by rust-deobf's deflattener on both arches — the red/blue loop.
+`test/matrix.sh` is the cross-platform / cross-architecture gate. On a single Linux host it builds
+every demo twice (baseline vs. `RUSTCLOAK_VM=1` full pipeline, fixed seed) and **runs both** on each
+of three real targets, requiring byte-identical stdout and exit code, then differential-fuzzes the
+VM on each:
+
+| target        | format      | CPU     | how it runs          |
+|---------------|-------------|---------|----------------------|
+| `linux-x64`   | ELF         | x86-64  | native               |
+| `linux-arm64` | ELF         | AArch64 | `qemu-aarch64-static`|
+| `win-x64`     | PE (mingw)  | x86-64  | `wine`               |
+
+A target whose toolchain or emulator is absent is reported `SKIP`, never a silent pass, so the
+output always names exactly which `{OS-format, CPU}` pairs were exercised. The differential fuzzer
+links the baseline and the virtualized `compute` into one static binary (`test/fuzz/vm_selfdiff.c`)
+so it runs unchanged under the emulators — no `dlopen`, no libFuzzer runtime needed. On x86-64 the
+coverage-guided libFuzzer differential (`test/fuzz/difffuzz_vm.sh`, driven by `difftest.sh`) runs
+too.
+
+Verified on **x86-64, AArch64, and Windows x86-64 (PE)**: on the C and Rust demos the obfuscated
+binary produces identical output, the secret string is absent from the file, and the control flow is
+flattened (the dispatcher gives every block a random 32-bit state constant). Across the stress path
+(which exercises every VM opcode path — arithmetic, memory, calls, loops) all three targets fold to
+the **same** checksum. The flattened output is also recovered end-to-end by rust-deobf's deflattener
+on x86-64 and AArch64 — the red/blue loop.
 
 ## Rust integration notes
 
