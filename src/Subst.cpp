@@ -103,6 +103,11 @@ PreservedAnalyses SubstPass::run(Function &F, FunctionAnalysisManager &) {
 
   bool changed = false;
   for (int round = 0; round < depth; round++) {
+    size_t n = 0;
+    for (BasicBlock &BB : F)
+      n += BB.size();
+    if (n > 20000)
+      break;  // Stop expansion of very large functions.
     std::vector<BinaryOperator *> ops;     // snapshot this round's operators (not the ones we create)
     for (BasicBlock &BB : F)
       for (Instruction &I : BB)
