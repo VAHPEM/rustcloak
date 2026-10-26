@@ -225,6 +225,8 @@ rustc +nightly-2024-06-15 -O -Zllvm-plugins=$PWD/build/libRustCloak.so prog.rs -
 opt-18 -load-pass-plugin=build/libRustCloak.so -passes='strenc,function(subst,bogus,flatten)' in.ll -S -o out.ll
 
 # Build-time flags (environment variables, so they work through clang and rustc alike):
+#   RUSTCLOAK_HARDEN=1   one-switch strong preset: VM + integrity + jump-table + two-way bogus +
+#                        runtime string keys + depth-2 MBA (not the ~100x-slower nested VM)
 #   RUSTCLOAK_SEED=N     reproducible build (default: random per build)
 #   RUSTCLOAK_SUBST_DEPTH=N  apply MBA substitution N times (1..4); deeper = larger expressions
 #   RUSTCLOAK_LAZY=1     decrypt each string on first use, not all at startup
@@ -302,7 +304,10 @@ single-function fixture `test/vm_one.c`:
 | `lift_vm.py` | static bytecode lift | not lifted | — | — | — |
 | `devirt_emulate.py` | Unicorn emulation | **recovered** | **recovered** | **defeated** | **defeated** |
 
-The reading: structural VM hardening (per-build randomized opcodes, encrypted operands, jump-table
+`RUSTCLOAK_HARDEN=1` turns the whole strong set on in one switch (integrity + jump-table + two-way
+bogus + runtime string keys + depth-2 MBA), and a `HARDEN` VM build is itself not recovered by
+`devirt_emulate.py` ("could not recover") — the integrity mode it includes is what defeats the
+emulator. The reading: structural VM hardening (per-build randomized opcodes, encrypted operands, jump-table
 dispatch) already defeats the **static** detector and lifter — but emulation observes the real
 computation and reconstructs it regardless of structure, so plain `virt` and even jump-table
 dispatch fall to `devirt_emulate.py`. The two hardening modes that *do* defeat the emulator here are

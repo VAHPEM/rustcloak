@@ -95,7 +95,7 @@ PreservedAnalyses SubstPass::run(Function &F, FunctionAnalysisManager &) {
     return PreservedAnalyses::all();
   auto gen = rustcloak::rng(("subst:" + F.getName()).str());
 
-  int depth = 1;
+  int depth = rustcloak::hardenPreset() ? 2 : 1;       // the strong preset nests MBA to depth 2
   if (const char *e = std::getenv("RUSTCLOAK_SUBST_DEPTH")) {
     depth = std::atoi(e);
     depth = depth < 1 ? 1 : (depth > 4 ? 4 : depth);   // bounded so expansion always terminates

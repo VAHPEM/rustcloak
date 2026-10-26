@@ -262,7 +262,7 @@ PreservedAnalyses BogusPass::run(Function &F, FunctionAnalysisManager &) {
   for (BasicBlock &BB : F)
     blocks.push_back(&BB);
 
-  bool twoway = std::getenv("RUSTCLOAK_BOGUS_TWOWAY") != nullptr;
+  bool twoway = rustcloak::flagOn("RUSTCLOAK_BOGUS_TWOWAY");
   bool changed = false;
   for (BasicBlock *BB : blocks) {
     if ((gen() & 1u) == 0u)               // guard about half the blocks

@@ -338,7 +338,7 @@ PreservedAnalyses StrEncPass::run(Module &M, ModuleAnalysisManager &) {
   // garbage. Default off; it does not affect a real run.
   AntiEmu ae_storage, *ae = nullptr;
   Type *I32 = Type::getInt32Ty(Ctx);
-  if (std::getenv("RUSTCLOAK_STRENC_SELFKEY") && !targets.empty()) {
+  if (rustcloak::flagOn("RUSTCLOAK_STRENC_SELFKEY") && !targets.empty()) {
     // Derive the key marker at run time from a hash of the ciphertext, so static recovery must
     // execute the hash rather than read a constant (see emitComputedMarkerCtor). The anchor is the
     // first encrypted string; its ciphertext bytes are known here, so magic is computed to match.

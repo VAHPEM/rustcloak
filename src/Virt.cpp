@@ -440,10 +440,10 @@ static bool virtualizeOnce(Function &F, unsigned layer) {
   // Anti-tamper (RUSTCLOAK_VM_INTEGRITY): the interpreter hashes its own bytecode at run time and
   // folds the hash into these operand keys, so patching any bytecode byte silently corrupts every
   // operand decode rather than tripping a comparison a patcher could NOP. Off by default.
-  bool integrity = getenv("RUSTCLOAK_VM_INTEGRITY") != nullptr;
+  bool integrity = rustcloak::flagOn("RUSTCLOAK_VM_INTEGRITY");
   // RUSTCLOAK_VM_JMP: dispatch through an encrypted block-address table reached by indirectbr,
   // instead of a bare switch a VM lifter can pattern-match (see the dispatch emission below).
-  bool jmp = getenv("RUSTCLOAK_VM_JMP") != nullptr;
+  bool jmp = rustcloak::flagOn("RUSTCLOAK_VM_JMP");
 
   SplitAllCriticalEdges(F);              // so PHI copies can live at predecessors
   // PHI copies are emitted only on UNCONDITIONAL-branch edges (see phiCopies, used only in the JMP
@@ -1043,7 +1043,7 @@ static bool virtualizeOnce(Function &F, unsigned layer) {
 static void prepareForRevirt(Function &F);
 
 PreservedAnalyses VirtPass::run(Function &F, FunctionAnalysisManager &) {
-  if (!getenv("RUSTCLOAK_VM"))
+  if (!rustcloak::flagOn("RUSTCLOAK_VM"))
     return PreservedAnalyses::all();
   if (!selectedForVirt(F))                 // selective/partial scoping (see selectedForVirt)
     return PreservedAnalyses::all();

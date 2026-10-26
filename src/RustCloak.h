@@ -28,6 +28,29 @@
 
 namespace rustcloak {
 
+// A build flag is "on" if its own environment variable is set, OR RUSTCLOAK_HARDEN selects the
+// strong preset that includes it. HARDEN is a one-switch way to turn on the recommended hardening
+// (bytecode integrity, encrypted jump-table dispatch, two-way opaque predicates, runtime-derived
+// string keys, and depth-2 MBA) without naming each knob -- it does NOT include the ~100x-slower
+// nested VM or the scope-narrowing selective modes, which are deliberate per-build choices.
+inline bool hardenPreset() {
+  static bool h = std::getenv("RUSTCLOAK_HARDEN") != nullptr;
+  return h;
+}
+inline bool flagOn(const char *name) {
+  if (std::getenv(name))
+    return true;
+  if (!hardenPreset())
+    return false;
+  static const char *const preset[] = {
+      "RUSTCLOAK_VM", "RUSTCLOAK_VM_INTEGRITY", "RUSTCLOAK_VM_JMP",
+      "RUSTCLOAK_BOGUS_TWOWAY", "RUSTCLOAK_STRENC_SELFKEY"};
+  for (const char *p : preset)
+    if (std::string(name) == p)
+      return true;
+  return false;
+}
+
 // One base seed per process (per build invocation). The seed comes from the environment variable
 // RUSTCLOAK_SEED (any strtoull-parsable value, e.g. 1 or 0x1234); unset -> a fresh random seed per
 // build, so every build differs. An env var is used rather than an LLVM `cl::opt` because command-
