@@ -1,10 +1,17 @@
 //===- StrEnc.cpp - string-literal encryption ------------------------------===//
 //
-// Every private constant i8 string is XOR-encrypted in the object with a per-string
-// keystream (key + index), the global is made writable, and a single shared decrypt
-// routine is registered as a global constructor, so the plaintext exists only in
-// memory at run time. Statically the file holds only ciphertext -- `strings`/FLOSS
-// see nothing; this is the shape rust-deobf's dynamic/emulation engines recover.
+// Every private constant i8 string is encrypted in the object with a per-string keystream, the
+// global is made writable, and the strings are decrypted at run time, so the plaintext never
+// exists statically -- `strings`/FLOSS see only ciphertext. Several knobs trade behaviour for
+// analysis difficulty, so the blue side (rust-deobf) gets a spectrum of test cases:
+//
+//   default                     linear keystream `seed + i`, decrypted eagerly by one startup ctor
+//   RUSTCLOAK_STRENC_CIPHER     per-string non-linear LCG keystream instead of `seed + i`
+//   RUSTCLOAK_LAZY              decrypt each string on first use (no gathered ctor), in place
+//   RUSTCLOAK_STRENC_CALLSITE   decrypt on first use into a SEPARATE buffer; the global stays
+//                               ciphertext at rest (a dump of the global's section never shows text)
+//   RUSTCLOAK_ANTIEMU           key the decryption on a marker a ctor sets before main, so a
+//                               deobfuscator that emulates the decryptor in isolation gets garbage
 //
 //===----------------------------------------------------------------------===//
 #include "RustCloak.h"
@@ -25,18 +32,40 @@ using namespace llvm;
 
 namespace {
 
-struct EncTarget { GlobalVariable *G; uint8_t key; uint64_t len; };
+// Linear-congruential constants (glibc's rand); the runtime helper and the compile-time
+// encryption below run the SAME recurrence so they agree byte-for-byte.
+static const uint32_t LCG_MUL = 1103515245u, LCG_ADD = 12345u;
 
-// A shared helper: void xor(i8* p, i64 len, i8 key) { for i: p[i] ^= key + (i8)i; }
-Function *getXorHelper(Module &M) {
+struct EncTarget { GlobalVariable *G; uint32_t seed; uint64_t len; };
+
+// Compile-time encryption: XOR each byte with the keystream the runtime helper will reproduce.
+//   linear : ks[i] = (uint8_t)(seed + i)
+//   cipher : an LCG seeded per string -- ks[i] = high byte of the i-th LCG state
+void xorKeystream(std::vector<uint8_t> &buf, uint32_t seed, bool cipher) {
+  uint32_t state = seed;
+  for (size_t i = 0; i < buf.size(); i++) {
+    uint8_t ks;
+    if (cipher) {
+      state = state * LCG_MUL + LCG_ADD;
+      ks = (uint8_t)(state >> 24);
+    } else {
+      ks = (uint8_t)(seed + i);
+    }
+    buf[i] ^= ks;
+  }
+}
+
+// A shared decrypt helper: void dec(i8* p, i64 len, i32 seed). Built once per module; its keystream
+// matches xorKeystream for the chosen mode.
+Function *getDecHelper(Module &M, bool cipher) {
   LLVMContext &Ctx = M.getContext();
   if (Function *F = M.getFunction(rustcloak::anon("xorh")))
     return F;
-  Type *I8 = Type::getInt8Ty(Ctx), *I64 = Type::getInt64Ty(Ctx);
-  Type *I8P = PointerType::getUnqual(Ctx);
-  FunctionType *FT = FunctionType::get(Type::getVoidTy(Ctx), {I8P, I64, I8}, false);
+  Type *I8 = Type::getInt8Ty(Ctx), *I32 = Type::getInt32Ty(Ctx), *I64 = Type::getInt64Ty(Ctx);
+  Type *Ptr = PointerType::getUnqual(Ctx);
+  FunctionType *FT = FunctionType::get(Type::getVoidTy(Ctx), {Ptr, I64, I32}, false);
   Function *F = Function::Create(FT, GlobalValue::InternalLinkage, rustcloak::anon("xorh"), M);
-  Argument *P = F->getArg(0), *Len = F->getArg(1), *Key = F->getArg(2);
+  Argument *P = F->getArg(0), *Len = F->getArg(1), *Seed = F->getArg(2);
 
   BasicBlock *Entry = BasicBlock::Create(Ctx, "entry", F);
   BasicBlock *Cond = BasicBlock::Create(Ctx, "cond", F);
@@ -46,6 +75,11 @@ Function *getXorHelper(Module &M) {
   IRBuilder<> B(Entry);
   AllocaInst *I = B.CreateAlloca(I64, nullptr, "i");
   B.CreateStore(ConstantInt::get(I64, 0), I);
+  AllocaInst *St = nullptr;
+  if (cipher) {                           // running LCG state, seeded once
+    St = B.CreateAlloca(I32, nullptr, "st");
+    B.CreateStore(Seed, St);
+  }
   B.CreateBr(Cond);
 
   B.SetInsertPoint(Cond);
@@ -53,9 +87,17 @@ Function *getXorHelper(Module &M) {
   B.CreateCondBr(B.CreateICmpULT(iv, Len), Body, Exit);
 
   B.SetInsertPoint(Body);
+  Value *ks;
+  if (cipher) {
+    Value *s = B.CreateLoad(I32, St);
+    s = B.CreateAdd(B.CreateMul(s, ConstantInt::get(I32, LCG_MUL)), ConstantInt::get(I32, LCG_ADD));
+    B.CreateStore(s, St);
+    ks = B.CreateTrunc(B.CreateLShr(s, ConstantInt::get(I32, 24)), I8);
+  } else {
+    ks = B.CreateAdd(B.CreateTrunc(Seed, I8), B.CreateTrunc(iv, I8));
+  }
   Value *ptr = B.CreateGEP(I8, P, iv);
   Value *b = B.CreateLoad(I8, ptr);
-  Value *ks = B.CreateAdd(Key, B.CreateTrunc(iv, I8));
   B.CreateStore(B.CreateXor(b, ks), ptr);
   B.CreateStore(B.CreateAdd(iv, ConstantInt::get(I64, 1)), I);
   B.CreateBr(Cond);
@@ -68,30 +110,29 @@ Function *getXorHelper(Module &M) {
 // Anti-emulation (RUSTCLOAK_ANTIEMU). A static deobfuscator that recovers strings by emulating the
 // decrypt function IN ISOLATION (as rust-deobf's engine does) never runs the program's global
 // constructors first. So we key the decryption on a marker global that a *separate* constructor
-// sets to `magic` before main: at real runtime marker==magic and the key is correct, but under
-// isolated emulation the marker constructor did not run, marker is still 0, and the key is wrong --
-// the emulated plaintext is garbage. (The blue counter is to initialise the environment -- run the
-// constructors -- before emulating, which this is designed to force.)
-struct AntiEmu { llvm::GlobalVariable *marker; uint8_t magic; };
+// sets to `magic` before main: at real runtime marker==magic and the seed is correct, but under
+// isolated emulation the marker ctor did not run, marker is still 0, and the seed is wrong -- the
+// emulated plaintext is garbage. (The blue counter is to run the constructors before emulating.)
+struct AntiEmu { GlobalVariable *marker; uint32_t magic; };
 
-// The i8 key to hand the xor helper: a plain constant, or -- under anti-emulation -- a value that
-// XOR-cancels to the real key only when the marker holds `magic`.
-Value *keyValue(IRBuilder<> &B, LLVMContext &Ctx, uint8_t key, const AntiEmu *ae) {
-  Type *I8 = Type::getInt8Ty(Ctx);
+// The i32 seed to hand the helper: a plain constant, or -- under anti-emulation -- a value that
+// XOR-cancels to the real seed only when the marker holds `magic`.
+Value *seedValue(IRBuilder<> &B, LLVMContext &Ctx, uint32_t seed, const AntiEmu *ae) {
+  Type *I32 = Type::getInt32Ty(Ctx);
   if (!ae)
-    return ConstantInt::get(I8, key);
-  LoadInst *m = B.CreateLoad(I8, ae->marker);
+    return ConstantInt::get(I32, seed);
+  LoadInst *m = B.CreateLoad(I32, ae->marker);
   m->setVolatile(true);                                  // keep the optimizer from folding it away
-  return B.CreateXor(ConstantInt::get(I8, (uint8_t)(key ^ ae->magic)), m);
+  return B.CreateXor(ConstantInt::get(I32, seed ^ ae->magic), m);
 }
 
 // A constructor (run before the decryptor and before main) that stores `magic` into the marker.
 void emitMarkerCtor(Module &M, const AntiEmu &ae) {
   LLVMContext &Ctx = M.getContext();
   Function *C = Function::Create(FunctionType::get(Type::getVoidTy(Ctx), false),
-                                 GlobalValue::InternalLinkage, rustcloak::anon("mk"), M);
+                                 GlobalValue::InternalLinkage, rustcloak::anon("mkc"), M);
   IRBuilder<> B(BasicBlock::Create(Ctx, "entry", C));
-  B.CreateStore(ConstantInt::get(Type::getInt8Ty(Ctx), ae.magic), ae.marker)->setVolatile(true);
+  B.CreateStore(ConstantInt::get(Type::getInt32Ty(Ctx), ae.magic), ae.marker)->setVolatile(true);
   B.CreateRetVoid();
   appendToGlobalCtors(M, C, 0);                          // priority 0: runs before the decryptor (1)
 }
@@ -105,23 +146,15 @@ void emitStartupCtor(Module &M, Function *Helper, ArrayRef<EncTarget> targets, c
   Type *I64 = Type::getInt64Ty(Ctx);
   for (auto &T : targets) {
     Value *P = B.CreateBitCast(T.G, PointerType::getUnqual(Ctx));
-    B.CreateCall(Helper, {P, ConstantInt::get(I64, T.len), keyValue(B, Ctx, T.key, ae)});
+    B.CreateCall(Helper, {P, ConstantInt::get(I64, T.len), seedValue(B, Ctx, T.seed, ae)});
   }
   B.CreateRetVoid();
   appendToGlobalCtors(M, Ctor, ae ? 1 : 0);              // after the marker ctor when anti-emu is on
 }
 
-// Lazy mode (RUSTCLOAK_LAZY): give one encrypted global its own getter that decrypts it on first
-// use -- guarded by a flag -- and returns its pointer, then redirect every use of the global to a
-// call of that getter. The plaintext then exists in memory only once the string is actually used,
-// and only for the strings that are reached, so a dump at startup (or of an unused path) sees only
-// ciphertext. Returns false and changes nothing if the global has a use that is not a plain
-// instruction operand (e.g. a ConstantExpr or a global initializer), so the caller can fall back to
-// decrypting it eagerly. (The flag check is not synchronised; a program that first touches the same
-// string from several threads at once would need a once-guard -- noted for a future revision.)
-// Rewrite every ConstantExpr that uses G (e.g. a `getelementptr` into the array) into an
-// equivalent instruction at each site that uses it, so that afterwards all of G's uses are plain
-// instruction operands the getter can be threaded through.
+// Rewrite every ConstantExpr that uses G (e.g. a `getelementptr` into the array) into an equivalent
+// instruction at each site that uses it, so afterwards all of G's uses are plain instruction
+// operands the getter can be threaded through.
 void expandConstantUsers(GlobalVariable *G) {
   bool changed = true;
   while (changed) {
@@ -145,9 +178,18 @@ void expandConstantUsers(GlobalVariable *G) {
   }
 }
 
-bool makeLazy(Module &M, Function *Helper, const EncTarget &T, const AntiEmu *ae) {
+// Lazy mode (RUSTCLOAK_LAZY): give one encrypted global its own getter that decrypts it on first
+// use -- guarded by a flag -- and returns its pointer, then redirect every use of the global to a
+// call of that getter. The plaintext then exists in memory only once the string is actually used,
+// and only for reached strings. Under RUSTCLOAK_STRENC_CALLSITE the getter decrypts into a SEPARATE
+// sibling buffer and returns that, so the original global stays ciphertext at rest even after use.
+// Returns false and changes nothing if the global has a use that is not a plain instruction operand
+// (e.g. a ConstantExpr or a global initializer), so the caller can fall back to eager decryption.
+// (The flag check is not synchronised; concurrent first-touch from several threads would need a
+// once-guard -- noted for a future revision.)
+bool makeLazy(Module &M, Function *Helper, const EncTarget &T, const AntiEmu *ae, bool callsite) {
   LLVMContext &Ctx = M.getContext();
-  Type *I1 = Type::getInt1Ty(Ctx), *I8 = Type::getInt8Ty(Ctx), *I64 = Type::getInt64Ty(Ctx);
+  Type *I1 = Type::getInt1Ty(Ctx), *I64 = Type::getInt64Ty(Ctx);
   Type *Ptr = PointerType::getUnqual(Ctx);
   GlobalVariable *G = T.G;
 
@@ -161,21 +203,30 @@ bool makeLazy(Module &M, Function *Helper, const EncTarget &T, const AntiEmu *ae
   if (uses.empty())
     return true;                         // encrypted but never referenced: nothing to redirect
 
+  // call-site mode: decrypt into a fresh sibling buffer (initialised to the same ciphertext), so the
+  // original global is never written and stays ciphertext at rest.
+  GlobalVariable *dec = G;
+  if (callsite) {
+    dec = new GlobalVariable(M, G->getValueType(), /*isConstant=*/false,
+                             GlobalValue::InternalLinkage, G->getInitializer(), rustcloak::anon("b"));
+    dec->setUnnamedAddr(GlobalValue::UnnamedAddr::None);
+  }
+
   auto *Flag = new GlobalVariable(M, I1, /*isConstant=*/false, GlobalValue::InternalLinkage,
                                   ConstantInt::getFalse(Ctx), rustcloak::anon("f"));
   Function *Get = Function::Create(FunctionType::get(Ptr, false),
                                    GlobalValue::InternalLinkage, rustcloak::anon("g"), M);
   BasicBlock *entry = BasicBlock::Create(Ctx, "", Get);
-  BasicBlock *dec = BasicBlock::Create(Ctx, "", Get);
+  BasicBlock *decbb = BasicBlock::Create(Ctx, "", Get);
   BasicBlock *done = BasicBlock::Create(Ctx, "", Get);
   IRBuilder<> B(entry);
-  B.CreateCondBr(B.CreateLoad(I1, Flag), done, dec);
-  B.SetInsertPoint(dec);
-  B.CreateCall(Helper, {G, ConstantInt::get(I64, T.len), keyValue(B, Ctx, T.key, ae)});
+  B.CreateCondBr(B.CreateLoad(I1, Flag), done, decbb);
+  B.SetInsertPoint(decbb);
+  B.CreateCall(Helper, {dec, ConstantInt::get(I64, T.len), seedValue(B, Ctx, T.seed, ae)});
   B.CreateStore(ConstantInt::getTrue(Ctx), Flag);
   B.CreateBr(done);
   B.SetInsertPoint(done);
-  B.CreateRet(G);
+  B.CreateRet(dec);
 
   for (Use *U : uses) {
     auto *I = cast<Instruction>(U->getUser());
@@ -193,6 +244,9 @@ bool makeLazy(Module &M, Function *Helper, const EncTarget &T, const AntiEmu *ae
 PreservedAnalyses StrEncPass::run(Module &M, ModuleAnalysisManager &) {
   LLVMContext &Ctx = M.getContext();
   auto gen = rustcloak::rng(("strenc:" + M.getName()).str());
+  bool cipher = std::getenv("RUSTCLOAK_STRENC_CIPHER") != nullptr;
+  bool callsite = std::getenv("RUSTCLOAK_STRENC_CALLSITE") != nullptr;
+  bool lazy = callsite || std::getenv("RUSTCLOAK_LAZY") != nullptr;  // call-site implies on-use
   std::vector<EncTarget> targets;
 
   for (GlobalVariable &G : M.globals()) {
@@ -221,40 +275,40 @@ PreservedAnalyses StrEncPass::run(Module &M, ModuleAnalysisManager &) {
     if (data.size() < 2 || data.size() > (1u << 16))
       continue;
 
-    uint8_t key = (uint8_t)(gen() | 1u);
+    // Per-string seed: a full 32-bit odd value in cipher mode, else an odd key byte (low 8 bits).
+    uint32_t seed = cipher ? ((uint32_t)gen() | 1u) : (uint32_t)(uint8_t)(gen() | 1u);
     std::vector<uint8_t> enc(data.begin(), data.end());
-    for (size_t i = 0; i < enc.size(); i++)
-      enc[i] ^= (uint8_t)(key + i);
+    xorKeystream(enc, seed, cipher);
     Constant *encArr = ConstantDataArray::get(Ctx, enc);
     G.setInitializer(wrapTy ? ConstantStruct::get(wrapTy, {encArr})
                             : encArr);
     G.setConstant(false);
     G.setUnnamedAddr(GlobalValue::UnnamedAddr::None); // the writable copy must not be merged
-    targets.push_back({&G, key, enc.size()});
+    targets.push_back({&G, seed, enc.size()});
   }
   if (targets.empty())
     return PreservedAnalyses::all();
 
-  Function *Helper = getXorHelper(M);
+  Function *Helper = getDecHelper(M, cipher);
   // RUSTCLOAK_ANTIEMU keys the decryption on a marker that a constructor sets before main, so a
   // deobfuscator that emulates the decryptor in isolation (without running constructors) recovers
   // garbage. Default off; it does not affect a real run.
   AntiEmu ae_storage, *ae = nullptr;
   if (std::getenv("RUSTCLOAK_ANTIEMU")) {
-    Type *I8 = Type::getInt8Ty(Ctx);
-    ae_storage.magic = (uint8_t)(gen() | 1u);
-    ae_storage.marker = new GlobalVariable(M, I8, /*isConstant=*/false, GlobalValue::InternalLinkage,
-                                           ConstantInt::get(I8, 0), rustcloak::anon("mk"));
+    Type *I32 = Type::getInt32Ty(Ctx);
+    ae_storage.magic = (uint32_t)gen() | 1u;
+    ae_storage.marker = new GlobalVariable(M, I32, /*isConstant=*/false, GlobalValue::InternalLinkage,
+                                           ConstantInt::get(I32, 0), rustcloak::anon("mkv"));
     emitMarkerCtor(M, ae_storage);
     ae = &ae_storage;
   }
-  // RUSTCLOAK_LAZY turns on on-demand decryption: each string decrypts the first time it is used,
-  // not at startup. Default (unset) keeps the eager startup-constructor behaviour, so the build is
-  // never affected unless the mode is explicitly requested.
-  if (std::getenv("RUSTCLOAK_LAZY")) {
+  // RUSTCLOAK_LAZY / RUSTCLOAK_STRENC_CALLSITE turn on on-demand decryption: each string decrypts
+  // the first time it is used, not at startup. Default keeps the eager startup-constructor
+  // behaviour, so a build is never affected unless a mode is explicitly requested.
+  if (lazy) {
     std::vector<EncTarget> deferred;
     for (auto &T : targets)
-      if (!makeLazy(M, Helper, T, ae))
+      if (!makeLazy(M, Helper, T, ae, callsite))
         deferred.push_back(T);           // not lazifiable -> still encrypted, decrypted eagerly
     if (!deferred.empty())
       emitStartupCtor(M, Helper, deferred, ae);
