@@ -440,6 +440,9 @@ static bool virtualizeOnce(Function &F, unsigned layer) {
   // folds the hash into these operand keys, so patching any bytecode byte silently corrupts every
   // operand decode rather than tripping a comparison a patcher could NOP. Off by default.
   bool integrity = getenv("RUSTCLOAK_VM_INTEGRITY") != nullptr;
+  // RUSTCLOAK_VM_JMP: dispatch through an encrypted block-address table reached by indirectbr,
+  // instead of a bare switch a VM lifter can pattern-match (see the dispatch emission below).
+  bool jmp = getenv("RUSTCLOAK_VM_JMP") != nullptr;
 
   SplitAllCriticalEdges(F);              // so PHI copies can live at predecessors
 
@@ -839,20 +842,50 @@ static bool virtualizeOnce(Function &F, unsigned layer) {
     if (seen[i])
       present.push_back(i);
 
-  SwitchInst *sw = B.CreateSwitch(opByte, bad, present.size());
   ArrayType *poolTy = cast<ArrayType>(poolInit->getType());
   auto finish = [&](Value *nextpc) {
     pc->addIncoming(nextpc, B.GetInsertBlock());
     B.CreateBr(loop);
   };
 
+  // one handler block per present opcode (bodies filled below)
+  DenseMap<unsigned, BasicBlock *> hblk;
+  for (unsigned ob : present)
+    hblk[ob] = BasicBlock::Create(Ctx, "", &F, bad);
+
+  // Dispatch. Default: a bare `switch opByte`. RUSTCLOAK_VM_JMP: an ENCRYPTED JUMP TABLE -- the
+  // opcode is run through a per-build affine permutation of 0..255 (A odd => a bijection mod 256) to
+  // index a global table of block addresses, and control transfers by `indirectbr`. There is then no
+  // switch for a symbolic VM-lifter to recognise as the dispatcher, and the opcode->handler mapping
+  // is hidden in the permuted table rather than sitting in readable case labels.
+  if (jmp) {
+    uint64_t A = (encRng() | 1u) & 0xffu, Bk = encRng() & 0xffu;
+    std::vector<Constant *> slots(256, BlockAddress::get(&F, bad));
+    for (unsigned ob : present)
+      slots[(A * ob + Bk) & 0xff] = BlockAddress::get(&F, hblk[ob]);
+    ArrayType *jtTy = ArrayType::get(ptrTy, 256);
+    auto *jtab = new GlobalVariable(M, jtTy, true, GlobalValue::InternalLinkage,
+                                    ConstantArray::get(jtTy, slots), rustcloak::anon("vj"));
+    Value *idx = B.CreateAnd(
+        B.CreateAdd(B.CreateMul(B.CreateZExt(opByte, i64), B.getInt64(A)), B.getInt64(Bk)),
+        B.getInt64(0xff));
+    Value *tp = B.CreateLoad(ptrTy, B.CreateGEP(jtTy, jtab, {B.getInt64(0), idx}));
+    IndirectBrInst *ibr = B.CreateIndirectBr(tp, present.size() + 1);
+    for (unsigned ob : present)
+      ibr->addDestination(hblk[ob]);
+    ibr->addDestination(bad);
+  } else {
+    SwitchInst *sw = B.CreateSwitch(opByte, bad, present.size());
+    for (unsigned ob : present)
+      sw->addCase(ConstantInt::get(cast<IntegerType>(i8), ob), hblk[ob]);
+  }
+
   static const unsigned WBITS[4] = {8, 16, 32, 64};
   for (unsigned ob : present) {
     uint8_t base = dec[ob & 0x3f];
     unsigned wbits = WBITS[(ob >> 6) & 3];
     Type *iW = IntegerType::get(Ctx, wbits);
-    BasicBlock *h = BasicBlock::Create(Ctx, "", &F, bad);
-    sw->addCase(ConstantInt::get(cast<IntegerType>(i8), ob), h);
+    BasicBlock *h = hblk[ob];
     B.SetInsertPoint(h);
 
     if (base == OP_RETV) { B.CreateRetVoid(); continue; }

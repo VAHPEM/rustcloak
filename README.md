@@ -113,6 +113,14 @@ Each transform lives in its own source file and can be used alone or together.
    mode. `test/select.sh` checks each mode virtualizes exactly the intended functions and that
    behaviour is preserved whatever the selection.
 
+   **Encrypted jump-table dispatch (`RUSTCLOAK_VM_JMP=1`).** By default the interpreter dispatches
+   with a `switch` on the opcode — the textbook shape a symbolic VM-lifter looks for first. In this
+   mode the switch is replaced by an *encrypted jump table*: the opcode is run through a per-build
+   affine permutation of 0..255 (`idx = (A·op + B) mod 256`, `A` odd so it is a bijection) that
+   indexes a global table of block addresses, and control transfers by `indirectbr`. There is then no
+   switch to pattern-match, and the opcode→handler mapping is scattered through the permuted table
+   rather than sitting in readable `case` labels. Behaviour is identical; verified across the matrix.
+
    **Nested virtualization — VM-in-VM (`RUSTCLOAK_VM_NEST=1`).** The layer-0 interpreter is itself a
    function, so it can be virtualized a second time: its dispatch loop, opcode handlers and operand
    decode all become bytecode for a *second*, independently-encoded VM (a different opcode permutation
@@ -197,6 +205,7 @@ opt-18 -load-pass-plugin=build/libRustCloak.so -passes='strenc,function(subst,bo
 #   RUSTCLOAK_VM_ONLY=a,b   virtualize only functions whose name contains a or b
 #   RUSTCLOAK_VM_SKIP=a,b   never virtualize functions whose name contains a or b
 #   RUSTCLOAK_VM_RATIO=P    virtualize a seeded ~P% of the otherwise-chosen functions
+#   RUSTCLOAK_VM_JMP=1      dispatch via an encrypted indirectbr jump table, not a switch
 #   RUSTCLOAK_VM_NEST=1     re-virtualize the interpreter itself (VM-in-VM; ~100x slower)
 #   RUSTCLOAK_VM_INTEGRITY=1  VM self-hashes its bytecode; tampering corrupts the operand keys
 #   RUSTCLOAK_OFF=1      disable all transforms (safety off-switch; emit a normal build)
