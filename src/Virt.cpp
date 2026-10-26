@@ -326,6 +326,10 @@ PreservedAnalyses VirtPass::run(Function &F, FunctionAnalysisManager &) {
   // each operand after fetch. (Register indices, pool indices and branch targets are all hidden.)
   std::mt19937_64 kg = rustcloak::rng(("vmkey:" + F.getName()).str());
   uint8_t kd = kg() & 0xff, ka = kg() & 0xff, kb = kg() & 0xff;
+  // Anti-tamper (RUSTCLOAK_VM_INTEGRITY): the interpreter hashes its own bytecode at run time and
+  // folds the hash into these operand keys, so patching any bytecode byte silently corrupts every
+  // operand decode rather than tripping a comparison a patcher could NOP. Off by default.
+  bool integrity = getenv("RUSTCLOAK_VM_INTEGRITY") != nullptr;
 
   SplitAllCriticalEdges(F);              // so PHI copies can live at predecessors
 
@@ -571,6 +575,16 @@ PreservedAnalyses VirtPass::run(Function &F, FunctionAnalysisManager &) {
     bytes.insert(bytes.end(), {vi.op, (uint8_t)(vi.dst ^ kd), (uint8_t)(a ^ ka), (uint8_t)(b ^ kb)});
   }
 
+  // FNV-1a-64 over the FINAL bytecode. When integrity is on, the interpreter recomputes this at run
+  // time; the XOR of the two is 0 for an intact blob and mixed into the operand keys, so a single
+  // flipped byte makes every subsequent operand decode wrong (addresses, register and pool indices,
+  // branch targets) and the VM diverges into garbage -- with no integrity-compare branch to patch.
+  uint64_t expected = 0xcbf29ce484222325ull;
+  for (uint8_t by : bytes) {
+    expected ^= by;
+    expected *= 0x100000001b3ull;
+  }
+
   // ---- globals -------------------------------------------------------------
   Constant *bcInit = ConstantDataArray::get(Ctx, ArrayRef<uint8_t>(bytes));
   auto *bc = new GlobalVariable(M, bcInit->getType(), false, GlobalValue::InternalLinkage,
@@ -622,21 +636,56 @@ PreservedAnalyses VirtPass::run(Function &F, FunctionAnalysisManager &) {
       v = B.CreateZExt(v, i64);
     B.CreateStore(v, regGEP(B.getInt64(P.slot[args[i]])));
   }
-  B.CreateBr(loop);
+  ArrayType *bcTy = cast<ArrayType>(bcInit->getType());
+
+  // Operand-decryption keys: the per-build constants, unless integrity is on -- then a run-time
+  // self-hash of the bytecode is XOR-folded in. `preLoop` is the block that falls into the dispatch
+  // loop (entry directly, or the hash epilogue), so the pc PHI's first incoming is correct.
+  Value *kdV = B.getInt64(kd), *kaV = B.getInt64(ka), *kbV = B.getInt64(kb);
+  BasicBlock *preLoop = entry;
+  if (integrity) {
+    BasicBlock *hloop = BasicBlock::Create(Ctx, "", &F, loop);
+    BasicBlock *hdone = BasicBlock::Create(Ctx, "", &F, loop);
+    B.CreateBr(hloop);
+    B.SetInsertPoint(hloop);
+    PHINode *hi = B.CreatePHI(i64, 2);   // byte index
+    PHINode *hh = B.CreatePHI(i64, 2);   // running FNV-1a state
+    hi->addIncoming(B.getInt64(0), entry);
+    hh->addIncoming(B.getInt64(0xcbf29ce484222325ull), entry);
+    LoadInst *hb = B.CreateLoad(i8, B.CreateGEP(bcTy, bc, {B.getInt64(0), hi}));
+    hb->setVolatile(true);               // volatile: the hash cannot be constant-folded away
+    Value *hhn = B.CreateMul(B.CreateXor(hh, B.CreateZExt(hb, i64)), B.getInt64(0x100000001b3ull));
+    Value *hin = B.CreateAdd(hi, B.getInt64(1));
+    hh->addIncoming(hhn, hloop);
+    hi->addIncoming(hin, hloop);
+    B.CreateCondBr(B.CreateICmpULT(hin, B.getInt64(bytes.size())), hloop, hdone);
+    B.SetInsertPoint(hdone);
+    Value *delta = B.CreateXor(hhn, B.getInt64(expected));   // 0 iff the bytecode is intact
+    auto foldByte = [&](uint8_t k, unsigned sh) {
+      return B.CreateXor(B.getInt64(k),
+                         B.CreateAnd(B.CreateLShr(delta, B.getInt64(sh)), B.getInt64(0xff)));
+    };
+    kdV = foldByte(kd, 0);
+    kaV = foldByte(ka, 8);
+    kbV = foldByte(kb, 16);
+    B.CreateBr(loop);
+    preLoop = hdone;
+  } else {
+    B.CreateBr(loop);
+  }
 
   B.SetInsertPoint(loop);
   PHINode *pc = B.CreatePHI(i64, 1 + 64);
-  pc->addIncoming(B.getInt64(0), entry);
-  ArrayType *bcTy = cast<ArrayType>(bcInit->getType());
+  pc->addIncoming(B.getInt64(0), preLoop);
   auto bcByte = [&](Value *o) {
     LoadInst *l = B.CreateLoad(i8, B.CreateGEP(bcTy, bc, {B.getInt64(0), o}));
     l->setVolatile(true);
     return l;
   };
   Value *opByte = bcByte(pc);          // opcode is permuted, not XOR-encrypted
-  Value *dst = B.CreateXor(B.CreateZExt(bcByte(B.CreateAdd(pc, B.getInt64(1))), i64), B.getInt64(kd));
-  Value *ra = B.CreateXor(B.CreateZExt(bcByte(B.CreateAdd(pc, B.getInt64(2))), i64), B.getInt64(ka));
-  Value *rb = B.CreateXor(B.CreateZExt(bcByte(B.CreateAdd(pc, B.getInt64(3))), i64), B.getInt64(kb));
+  Value *dst = B.CreateXor(B.CreateZExt(bcByte(B.CreateAdd(pc, B.getInt64(1))), i64), kdV);
+  Value *ra = B.CreateXor(B.CreateZExt(bcByte(B.CreateAdd(pc, B.getInt64(2))), i64), kaV);
+  Value *rb = B.CreateXor(B.CreateZExt(bcByte(B.CreateAdd(pc, B.getInt64(3))), i64), kbV);
   Value *pc4 = B.CreateAdd(pc, B.getInt64(4));
   Value *tgt = B.CreateOr(ra, B.CreateShl(rb, 8));
   auto loadReg = [&](Value *idx) { return B.CreateLoad(i64, regGEP(idx)); };

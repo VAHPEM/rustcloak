@@ -98,8 +98,18 @@ Each transform lives in its own source file and can be used alone or together.
    arguments and dispatch through a per-function callee-pointer table, so a function that calls
    helpers virtualizes whole (direct, non-vararg, non-intrinsic callees with ≤6 integer/pointer
    args). Left native: indirect/vararg/intrinsic calls, global references, floats, vectors. Verified
-   behaviour-identical to native on x86-64 and AArch64 over a 20,000-iteration stress fold through
-   real buffers, across seeds (each a different opcode map).
+   behaviour-identical to native on x86-64, AArch64 and Windows x86-64 over a 20,000-iteration stress
+   fold through real buffers, across seeds (each a different opcode map).
+
+   **Anti-tamper bytecode integrity (`RUSTCLOAK_VM_INTEGRITY=1`).** On top of the per-build operand
+   encryption, the interpreter can hash *its own bytecode* at run time (FNV-1a-64 over the blob, via
+   the same volatile loads it executes) and XOR-fold the result into the operand-decryption keys. For
+   an intact blob the hash matches a compile-time constant, the fold is zero, and the VM runs exactly
+   as before; flip **any** bytecode byte and the hash changes, so every subsequent operand decode —
+   register indices, pool indices, branch targets — comes out wrong and the VM diverges into garbage
+   or crashes. Crucially there is **no `if (hash != expected)` branch** to locate and NOP: the check
+   *is* the decryption. `test/tamper.sh` flips every byte of a function's bytecode and confirms the
+   protected build catches 100% of single-byte flips where the unprotected build misses some.
 
 **Per-build randomness.** All state numbers and keys come from a build seed. By default the seed is
 random per build, so two builds of the same program differ (no two copies look alike); pass
@@ -156,6 +166,7 @@ opt-18 -load-pass-plugin=build/libRustCloak.so -passes='strenc,function(subst,bo
 #   RUSTCLOAK_LAZY=1     decrypt each string on first use, not all at startup
 #   RUSTCLOAK_ANTIEMU=1  bind string keys to a loader-set marker (defeats isolated emulation)
 #   RUSTCLOAK_VM=1       virtualize eligible functions into custom-bytecode + interpreter
+#   RUSTCLOAK_VM_INTEGRITY=1  VM self-hashes its bytecode; tampering corrupts the operand keys
 #   RUSTCLOAK_OFF=1      disable all transforms (safety off-switch; emit a normal build)
 ```
 
