@@ -349,11 +349,18 @@ PreservedAnalyses StrEncPass::run(Module &M, ModuleAnalysisManager &) {
     if (!cda)
       if (auto *cs = dyn_cast<ConstantStruct>(init))
         cda = dyn_cast<ConstantDataArray>(cs->getOperand(0));
-    StringRef ct = cda->getRawDataValues();
+    // FNV-1a-32 over the ciphertext, matching the runtime hash. If the ciphertext is entirely zero,
+    // ConstantStruct::get folds it to a ConstantAggregateZero (cda is then null) -- hash `alen` zero
+    // bytes, which is exactly what the run-time loop reads from the all-zero anchor global.
     uint32_t magic = 2166136261u;
-    for (unsigned char b : ct) {
-      magic ^= b;
-      magic *= 16777619u;
+    if (cda) {
+      for (unsigned char b : cda->getRawDataValues()) {
+        magic ^= b;
+        magic *= 16777619u;
+      }
+    } else {
+      for (uint64_t i = 0; i < alen; i++)
+        magic *= 16777619u;              // magic ^= 0 is a no-op
     }
     ae_storage.magic = magic;
     ae_storage.marker = new GlobalVariable(M, I32, /*isConstant=*/false, GlobalValue::InternalLinkage,

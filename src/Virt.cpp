@@ -30,6 +30,7 @@
 #include "RustCloak.h"
 
 #include "llvm/ADT/DenseMap.h"
+#include "llvm/IR/CFG.h"
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/DataLayout.h"
 #include "llvm/IR/Function.h"
@@ -445,6 +446,35 @@ static bool virtualizeOnce(Function &F, unsigned layer) {
   bool jmp = getenv("RUSTCLOAK_VM_JMP") != nullptr;
 
   SplitAllCriticalEdges(F);              // so PHI copies can live at predecessors
+  // PHI copies are emitted only on UNCONDITIONAL-branch edges (see phiCopies, used only in the JMP
+  // arm of the terminator emission). SplitAllCriticalEdges splits conditional edges into multi-pred
+  // PHI blocks, but a conditional edge into a SINGLE-predecessor PHI block is not "critical" and is
+  // left intact -- and would then get no PHI copy, leaving the PHI's VM register uninitialised. Split
+  // those too, so every PHI predecessor ends in an unconditional branch. (Rare in optimized IR --
+  // simplifycfg folds single-entry PHIs -- but reachable with hand-written IR or explicit -passes.)
+  {
+    std::vector<std::pair<BranchInst *, BasicBlock *>> edges;
+    for (BasicBlock &BB : F) {
+      auto *br = dyn_cast<BranchInst>(BB.getTerminator());
+      if (!br || !br->isConditional() || br->getSuccessor(0) == br->getSuccessor(1))
+        continue;                        // skip a degenerate `br c, X, X` (effectively uncond)
+      for (BasicBlock *succ : successors(&BB))
+        if (!succ->phis().empty())
+          edges.push_back({br, succ});
+    }
+    // Insert a fresh block ON each such edge (not via SplitEdge, which for a single-predecessor
+    // successor splits the SUCCESSOR and leaves the conditional edge reaching the PHI directly). The
+    // new block branches unconditionally to the real successor, so phiCopies runs there.
+    for (auto &e : edges) {
+      BranchInst *br = e.first;
+      BasicBlock *succ = e.second, *src = br->getParent();
+      BasicBlock *mid = BasicBlock::Create(F.getContext(), "", &F, succ);
+      BranchInst::Create(succ, mid);
+      br->replaceSuccessorWith(succ, mid);
+      for (PHINode &phi : succ->phis())
+        phi.replaceIncomingBlockWith(src, mid);
+    }
+  }
 
   Module &M = *F.getParent();
   LLVMContext &Ctx = M.getContext();
