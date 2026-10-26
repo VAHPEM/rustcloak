@@ -33,7 +33,9 @@ PreservedAnalyses SubstPass::run(Function &F, FunctionAnalysisManager &) {
   for (BasicBlock &BB : F)
     for (Instruction &I : BB)
       if (auto *bo = dyn_cast<BinaryOperator>(&I))
-        if (bo->getType()->isIntegerTy())
+        // Skip i1: the Add/Sub rewrites use `shl x, 1`, which is poison at bit width 1 (shift
+        // amount == width). At width >= 2 the shift by 1 is always well-defined.
+        if (bo->getType()->isIntegerTy() && bo->getType()->getIntegerBitWidth() >= 2)
           ops.push_back(bo);
 
   bool changed = false;

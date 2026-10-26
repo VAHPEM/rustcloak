@@ -119,6 +119,11 @@ static bool okOperand(Value *v) {
 // pointer arguments (all passed in registers on SysV/AAPCS, so a uniform i64(i64x6) thunk is ABI-
 // safe), returning an integer/pointer/void. Float/vector args or >6 args -> leave the function
 // native.
+// The VM's width-sensitive opcodes carry a 2-bit width code that decodes to {8,16,32,64}. An
+// integer of any other width would be decoded as 64-bit and mis-handled, so such ops are only
+// virtualized at these widths.
+static bool stdWidth(unsigned w) { return w == 8 || w == 16 || w == 32 || w == 64; }
+
 static Function *virtCallee(CallInst *ci) {
   if (ci->isInlineAsm())
     return nullptr;
@@ -129,7 +134,14 @@ static Function *virtCallee(CallInst *ci) {
     if (!isRegTy(a->getType()))
       return nullptr;
   Type *rt = ci->getType();
-  return (rt->isVoidTy() || isRegTy(rt)) ? callee : nullptr;
+  // Returned through a uniform i64 thunk: void and pointer are fine as-is; a narrow int is re-zero-
+  // extended by the CALL handler from its (standard) width. A non-standard int return width has no
+  // width-code slot, so leave such a callee native.
+  if (rt->isVoidTy() || rt->isPointerTy())
+    return callee;
+  if (rt->isIntegerTy() && stdWidth(rt->getIntegerBitWidth()))
+    return callee;
+  return nullptr;
 }
 
 static bool eligible(Function &F) {
@@ -152,13 +164,31 @@ static bool eligible(Function &F) {
         return false;
       bool ok = false;
       if (auto *bo = dyn_cast<BinaryOperator>(&I)) {
-        ok = bo->getType()->isIntegerTy() && bo->getType()->getIntegerBitWidth() <= 64;
+        unsigned w = bo->getType()->isIntegerTy() ? bo->getType()->getIntegerBitWidth() : 0;
+        bool bitwise = bo->getOpcode() == Instruction::And ||
+                       bo->getOpcode() == Instruction::Or ||
+                       bo->getOpcode() == Instruction::Xor;
+        // arithmetic/shift must be a standard width (correctly width-decoded); bitwise ops are
+        // correct at any width <= 64 on zero-extended lanes, so boolean i1 and/or/xor stay in.
+        ok = stdWidth(w) || (bitwise && w >= 1 && w <= 64);
       } else if (auto *ic = dyn_cast<ICmpInst>(&I)) {
-        ok = ic->getOperand(0)->getType()->isIntegerTy() && cmpBase(ic->getPredicate());
+        unsigned w = ic->getOperand(0)->getType()->isIntegerTy()
+                         ? ic->getOperand(0)->getType()->getIntegerBitWidth() : 0;
+        bool eqne = ic->getPredicate() == CmpInst::ICMP_EQ ||
+                    ic->getPredicate() == CmpInst::ICMP_NE;
+        // standard widths for any predicate; i1 only for eq/ne (a non-standard width would be
+        // compared at 64-bit, which is wrong for signed predicates).
+        ok = cmpBase(ic->getPredicate()) && (stdWidth(w) || (w == 1 && eqne));
       } else if (auto *se = dyn_cast<SelectInst>(&I)) {
         ok = se->getCondition()->getType()->isIntegerTy(1) && isRegTy(se->getType());
-      } else if (isa<TruncInst>(&I) || isa<ZExtInst>(&I) || isa<SExtInst>(&I)) {
+      } else if (isa<TruncInst>(&I) || isa<ZExtInst>(&I)) {
+        // trunc -> AND with a mask (any target width); zext -> MOV (copy of a clean lane).
         ok = I.getType()->isIntegerTy() && I.getOperand(0)->getType()->isIntegerTy();
+      } else if (auto *se2 = dyn_cast<SExtInst>(&I)) {
+        // sext truncates to the SOURCE width (width-encoded) then sign-extends, so the source
+        // width must be standard.
+        ok = se2->getType()->isIntegerTy() && se2->getOperand(0)->getType()->isIntegerTy() &&
+             stdWidth(se2->getOperand(0)->getType()->getIntegerBitWidth());
       } else if (isa<PtrToIntInst>(&I) || isa<IntToPtrInst>(&I)) {
         ok = true;
       } else if (auto *bc = dyn_cast<BitCastInst>(&I)) {
@@ -170,11 +200,11 @@ static bool eligible(Function &F) {
             ok = false;                  // struct index must be constant (always true in valid IR)
       } else if (auto *ld = dyn_cast<LoadInst>(&I)) {
         ok = !ld->isAtomic() && !ld->isVolatile() &&
-             ld->getType()->isIntegerTy() && ld->getType()->getIntegerBitWidth() <= 64;
+             ld->getType()->isIntegerTy() && stdWidth(ld->getType()->getIntegerBitWidth());
       } else if (auto *st = dyn_cast<StoreInst>(&I)) {
         Type *vt = st->getValueOperand()->getType();
         ok = !st->isAtomic() && !st->isVolatile() &&
-             vt->isIntegerTy() && vt->getIntegerBitWidth() <= 64;
+             vt->isIntegerTy() && stdWidth(vt->getIntegerBitWidth());
       } else if (isa<PHINode>(&I)) {
         ok = isRegTy(I.getType());
       } else if (auto *ci = dyn_cast<CallInst>(&I)) {
@@ -258,12 +288,34 @@ PreservedAnalyses VirtPass::run(Function &F, FunctionAnalysisManager &) {
       for (Value *op : I.operands())
         if (auto *ci = dyn_cast<ConstantInt>(op))
           wantConst(ci->getZExtValue());
+      if (auto *tr = dyn_cast<TruncInst>(&I)) {
+        // A trunc lowers to AND with a width mask; collect that mask HERE, before the OP_CONST ops
+        // are emitted below -- a mask first requested during emission would get a register but no
+        // OP_CONST to initialise it, i.e. an uninitialised register. (bug fix)
+        unsigned w = tr->getType()->getIntegerBitWidth();
+        wantConst(w >= 64 ? ~0ull : ((1ull << w) - 1));
+      }
       if (auto *gep = dyn_cast<GetElementPtrInst>(&I)) {
+        // Mirror lowerGEP exactly: a stride multiply per VARIABLE index, plus ONE add of the folded
+        // constant offset (constant indices and struct-field offsets). Both the strides and that
+        // folded offset are read from the pool, so both must be collected here. (Previously only
+        // strides were, and the folded offset was looked up with operator[], silently inserting 0
+        // -> register 0 -> wrong address.) (bug fix)
+        uint64_t constOff = 0;
         for (auto it = gep_type_begin(gep), e = gep_type_end(gep); it != e; ++it) {
-          if (it.getStructTypeOrNull())
+          if (StructType *STy = it.getStructTypeOrNull()) {
+            unsigned f = cast<ConstantInt>(it.getOperand())->getZExtValue();
+            constOff += DL.getStructLayout(STy)->getElementOffset(f);
             continue;
-          wantConst(DL.getTypeAllocSize(it.getIndexedType()).getFixedValue());
+          }
+          uint64_t stride = DL.getTypeAllocSize(it.getIndexedType()).getFixedValue();
+          if (auto *ci = dyn_cast<ConstantInt>(it.getOperand()))
+            constOff += (uint64_t)ci->getSExtValue() * stride;   // folded, not a pool stride
+          else
+            wantConst(stride);                                   // runtime index: stride needed
         }
+        if (constOff)
+          wantConst(constOff);
       }
     }
   wantConst(0);
@@ -380,8 +432,7 @@ PreservedAnalyses VirtPass::run(Function &F, FunctionAnalysisManager &) {
       } else if (isa<SExtInst>(&I)) {
         emit(OP_SEXT, widthOf(I.getOperand(0)), d, regOf(I.getOperand(0)), 0);
       } else if (auto *tr = dyn_cast<TruncInst>(&I)) {
-        unsigned w = widthOf(tr);
-        wantConst(w >= 64 ? ~0ull : ((1ull << w) - 1));
+        unsigned w = widthOf(tr);          // mask was pre-collected in the constant-gather pass
         emit(OP_AND, 64, d, regOf(tr->getOperand(0)), P.creg[w >= 64 ? ~0ull : ((1ull << w) - 1)]);
       } else if (isa<PtrToIntInst>(&I) || isa<IntToPtrInst>(&I) || isa<BitCastInst>(&I)) {
         emit(OP_MOV, 64, d, regOf(I.getOperand(0)), 0);
@@ -396,7 +447,15 @@ PreservedAnalyses VirtPass::run(Function &F, FunctionAnalysisManager &) {
         for (Value *a : ci->args())          // stage each argument, then call
           emit(OP_PUSHARG, 64, 0, regOf(a), 0);
         unsigned rd = ci->getType()->isVoidTy() ? voidScratch : d;
-        emit(OP_CALL, 64, rd, calleeIdx[ci->getCalledFunction()], 0);
+        // Carry the return width in the opcode's width field so the handler can re-zero-extend a
+        // narrow int return (the ABI leaves the high bits of the return register undefined).
+        // Pointer/i64/void -> width 64 (no masking). (bug fix)
+        unsigned callw = 64;
+        if (ci->getType()->isIntegerTy()) {
+          unsigned rw = ci->getType()->getIntegerBitWidth();
+          if (rw == 8 || rw == 16 || rw == 32) callw = rw;
+        }
+        emit(OP_CALL, callw, rd, calleeIdx[ci->getCalledFunction()], 0);
       }
     }
     Instruction *term = BB->getTerminator();
@@ -416,6 +475,11 @@ PreservedAnalyses VirtPass::run(Function &F, FunctionAnalysisManager &) {
       }
     }
   }
+
+  // Branch/jump targets are encoded in two bytes (offset <= 0xffff). A larger bytecode would
+  // silently truncate them, so leave such a (large) function native. (bug fix)
+  if (code.size() * 4 > 0xffff)
+    return PreservedAnalyses::all();
 
   std::vector<uint8_t> bytes;
   bytes.reserve(code.size() * 4);
@@ -560,7 +624,10 @@ PreservedAnalyses VirtPass::run(Function &F, FunctionAnalysisManager &) {
       SmallVector<Value *, 6> cargs;
       for (unsigned k = 0; k < 6; k++)
         cargs.push_back(B.CreateLoad(i64, B.CreateGEP(argbufTy, argbuf, {B.getInt64(0), B.getInt64(k)})));
-      storeReg(dst, B.CreateCall(thunk, fp, cargs));
+      Value *res = B.CreateCall(thunk, fp, cargs);
+      if (wbits < 64)                      // narrow int return: re-establish the zero-extended lane
+        res = B.CreateZExt(B.CreateTrunc(res, iW), i64);
+      storeReg(dst, res);
       B.CreateStore(B.getInt64(0), argn);
       finish(pc4);
       continue;
