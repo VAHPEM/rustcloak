@@ -254,6 +254,7 @@ RUSTCLOAK_NIGHTLY=nightly-2024-06-15 ./test/rust_demo.sh   # Rust: -Zllvm-plugin
 ./test/tamper.sh                               # VM integrity: every bytecode byte-flip is caught
 ./test/nest.sh                                 # nested VM-in-VM engages and stays correct
 ./test/select.sh ./test/selfkey.sh ./test/twoway.sh   # selective VM / runtime key / two-way bogus
+RUSTDEOBF=../vahpem/rust-deobf ./test/redblue.sh   # run the real deobfuscator; report what it recovers
 ```
 
 Both of the first two scripts are architecture-agnostic (set `RUSTCLOAK_TARGET=<triple>`, e.g.
@@ -285,6 +286,31 @@ flattened (the dispatcher gives every block a random 32-bit state constant). Acr
 (which exercises every VM opcode path — arithmetic, memory, calls, loops) all three targets fold to
 the **same** checksum. The flattened output is also recovered end-to-end by rust-deobf's deflattener
 on x86-64 and AArch64 — the red/blue loop.
+
+## Red/blue measurement — run the real deobfuscator
+
+Rather than proxy metrics (entropy, fold-survival), `test/redblue.sh` runs the actual counterpart
+analysis toolkit, [rust-deobf](https://github.com/VAHPEM/rust-deobf), against RustCloak's own VM
+output and reports what it recovers. Point `RUSTDEOBF` at a checkout and install its Python deps
+(`lief`, `capstone<6`, `unicorn`, `z3`); otherwise it prints how to get them and skips. On the
+single-function fixture `test/vm_one.c`:
+
+| blue tool | technique | plain `virt` | `+VM_JMP` | `+INTEGRITY` | `+NEST` |
+|-----------|-----------|:---:|:---:|:---:|:---:|
+| `detect_vm.py` | static VM detection | not detected | — | — | — |
+| `lift_vm.py` | static bytecode lift | not lifted | — | — | — |
+| `devirt_emulate.py` | Unicorn emulation | **recovered** | **recovered** | **defeated** | **defeated** |
+
+The reading: structural VM hardening (per-build randomized opcodes, encrypted operands, jump-table
+dispatch) already defeats the **static** detector and lifter — but emulation observes the real
+computation and reconstructs it regardless of structure, so plain `virt` and even jump-table
+dispatch fall to `devirt_emulate.py`. The two hardening modes that *do* defeat the emulator here are
+**bytecode integrity** (the operand keys become a run-time function of the bytecode hash, which the
+devirtualizer's key-recovery does not model) and **nested virtualization** (the emulator recovers the
+*inner* interpreter's program, not the original function). Emulation's ultimate counter is executing
+the sample — which RustCloak deliberately does not try to block with anti-analysis runtime behaviour;
+it answers emulation only where it can do so statically (the strenc `SELFKEY`/`ANTIEMU` loader-bound
+keys). This is the honest state of the art, measured, not asserted.
 
 ## Rust integration notes
 
