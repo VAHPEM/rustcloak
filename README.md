@@ -84,6 +84,16 @@ Each transform lives in its own source file and can be used alone or together.
    `(x² ^ x) & 1 == 0`, `(x | 1) & 1 == 1`, and `(x&1)·(x&1) == (x&1)`. Each guarded block gains a
    fake alternate path that never executes but clutters the control-flow graph.
 
+   **Two-way opaque predicates (`RUSTCLOAK_BOGUS_TWOWAY=1`).** The one-way form above has a dead arm a
+   prover can prune once it shows the predicate constant. The two-way form has *no dead arm*: it
+   splits a block and routes a live integer value through a diamond whose two arms recompute that
+   value by different (equivalent) expressions and feed a PHI the tail then uses, selected by a
+   genuinely data-dependent predicate (a live value's low bit). Both arms are reachable and each
+   carries a volatile read of module data folded as `& 0` — a no-op for the result, but a real side
+   effect, so the optimizer will not speculate the arms away and collapse the diamond into a `select`.
+   The branch therefore survives a `simplifycfg` pass (verified), there is no always-true constant to
+   fold, and no volatile store-to-sink signature. See `test/twoway.sh`.
+
 5. **Code virtualization — `virt` (`src/Virt.cpp`).** The strongest transform. Instead of leaving a
    function as native code, `virt` compiles its computation into a custom **bytecode** for a made-up
    **register machine (machine virtuelle à registres)** and replaces the function body with a
@@ -216,6 +226,7 @@ opt-18 -load-pass-plugin=build/libRustCloak.so -passes='strenc,function(subst,bo
 #   RUSTCLOAK_LAZY=1     decrypt each string on first use, not all at startup
 #   RUSTCLOAK_ANTIEMU=1  bind string keys to a loader-set marker (defeats isolated emulation)
 #   RUSTCLOAK_STRENC_SELFKEY=1  derive that marker by hashing the ciphertext (key is never a constant)
+#   RUSTCLOAK_BOGUS_TWOWAY=1  two-way opaque predicates (both arms live, no prunable dead branch)
 #   RUSTCLOAK_VM=1       virtualize eligible functions into custom-bytecode + interpreter
 #   RUSTCLOAK_VM_SELECTIVE=1  virtualize only sensitive-named functions (not every eligible one)
 #   RUSTCLOAK_VM_ONLY=a,b   virtualize only functions whose name contains a or b

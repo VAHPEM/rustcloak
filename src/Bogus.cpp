@@ -123,6 +123,95 @@ bool bogusBlock(BasicBlock *BB, Module &M, std::mt19937_64 &gen) {
   return true;
 }
 
+// A TWO-WAY opaque predicate (RUSTCLOAK_BOGUS_TWOWAY). The one-way form above guards the real path
+// with an always-true predicate and a dead bogus block -- which `simplifycfg` can prune once it
+// proves the predicate constant. This form has NO dead branch: it splits the block and routes a live
+// integer value through a diamond whose two arms recompute that value by DIFFERENT (equivalent)
+// expressions, selected by a genuinely data-dependent predicate on a live value. Both arms are
+// reachable and both feed a PHI the tail then uses, so neither can be folded away as dead, and the
+// branch encodes a real (if irrelevant) runtime decision rather than a constant.
+bool twoWayBlock(BasicBlock *BB, Module &M, std::mt19937_64 &gen) {
+  if (BB->isEHPad())
+    return false;
+  Instruction *split = BB->getFirstNonPHI();
+  if (!split || split == BB->getTerminator())
+    return false;
+  unsigned skip = gen() % 3;
+  for (unsigned i = 0; i < skip && split->getNextNode() &&
+                       split->getNextNode() != BB->getTerminator();
+       i++)
+    split = split->getNextNode();
+  if (split == BB->getTerminator())
+    return false;
+
+  BasicBlock *tail = BB->splitBasicBlock(split, "");
+  // A live integer value defined in the head (or an argument) and used in the tail: routing it
+  // through the diamond gives the arms a real, used result, so nothing is dead code.
+  Value *v = nullptr;
+  for (Instruction &I : *tail) {
+    for (Value *op : I.operands()) {
+      if (auto *vi = dyn_cast<Instruction>(op)) {
+        if (vi->getParent() == BB && vi->getType()->isIntegerTy() &&
+            vi->getType()->getIntegerBitWidth() >= 2) { v = vi; break; }
+      } else if (auto *arg = dyn_cast<Argument>(op)) {
+        if (arg->getType()->isIntegerTy() && arg->getType()->getIntegerBitWidth() >= 2) { v = arg; break; }
+      }
+    }
+    if (v) break;
+  }
+  if (!v)
+    return false;                      // nothing to route -> leave the plain split (still correct)
+
+  LLVMContext &Ctx = M.getContext();
+  Type *ty = v->getType();
+  Function *F = BB->getParent();
+  BasicBlock *A = BasicBlock::Create(Ctx, "", F, tail);
+  BasicBlock *Bb = BasicBlock::Create(Ctx, "", F, tail);
+  BasicBlock *join = BasicBlock::Create(Ctx, "", F, tail);
+
+  Instruction *term = BB->getTerminator();   // the `br tail` splitBasicBlock created
+  IRBuilder<> H(term);
+  // genuinely data-dependent selector (low bit of a live value): both arms are correct, so which one
+  // runs does not matter -- but it is not a constant, so neither arm is statically dead.
+  Value *sel = H.CreateICmpNE(H.CreateAnd(v, ConstantInt::get(ty, 1)), ConstantInt::get(ty, 0));
+  BranchInst::Create(A, Bb, sel, term);
+  term->eraseFromParent();
+
+  // Each arm reads a module-internal global through a VOLATILE load and folds `& 0` of it into its
+  // result: the value is always 0 (so the arm still computes v), but the volatile read is a real
+  // side effect, so the optimizer will not speculate the arm and collapse the diamond into a plain
+  // `select` -- the two-way branch survives. A volatile *read* of program data is also far less of a
+  // signature than a volatile store to a dedicated sink.
+  Type *I32 = Type::getInt32Ty(Ctx);
+  uint64_t K1 = gen(), K2 = gen() | 1u;
+  auto zeroFrom = [&](IRBuilder<> &BX) {      // == 0, but anchored to a volatile read
+    LoadInst *l = BX.CreateLoad(I32, internalI32(M, rustcloak::anon("ox")));
+    l->setVolatile(true);
+    return BX.CreateZExtOrTrunc(BX.CreateAnd(l, ConstantInt::get(I32, 0)), ty);
+  };
+  IRBuilder<> BA(A);                          // vA = ((v + K1) - K1) + 0  == v
+  Value *vA = BA.CreateAdd(BA.CreateSub(BA.CreateAdd(v, ConstantInt::get(ty, K1)),
+                                        ConstantInt::get(ty, K1)), zeroFrom(BA));
+  BA.CreateBr(join);
+  IRBuilder<> BB2(Bb);                        // vB = ((v ^ K2) ^ K2) + 0  == v
+  Value *vB = BB2.CreateAdd(BB2.CreateXor(BB2.CreateXor(v, ConstantInt::get(ty, K2)),
+                                          ConstantInt::get(ty, K2)), zeroFrom(BB2));
+  BB2.CreateBr(join);
+  IRBuilder<> BJ(join);
+  PHINode *vp = BJ.CreatePHI(ty, 2);
+  vp->addIncoming(vA, A);
+  vp->addIncoming(vB, Bb);
+  BJ.CreateBr(tail);
+
+  // Redirect the tail's uses of v to the PHI (join dominates tail, so this is valid SSA). Uses of v
+  // in the head / arms keep the original value.
+  for (Instruction &I : *tail)
+    for (Use &U : I.operands())
+      if (U.get() == v)
+        U.set(vp);
+  return true;
+}
+
 } // namespace
 
 PreservedAnalyses BogusPass::run(Function &F, FunctionAnalysisManager &) {
@@ -135,11 +224,12 @@ PreservedAnalyses BogusPass::run(Function &F, FunctionAnalysisManager &) {
   for (BasicBlock &BB : F)
     blocks.push_back(&BB);
 
+  bool twoway = std::getenv("RUSTCLOAK_BOGUS_TWOWAY") != nullptr;
   bool changed = false;
   for (BasicBlock *BB : blocks) {
     if ((gen() & 1u) == 0u)               // guard about half the blocks
       continue;
-    changed |= bogusBlock(BB, M, gen);
+    changed |= twoway ? twoWayBlock(BB, M, gen) : bogusBlock(BB, M, gen);
   }
   return changed ? PreservedAnalyses::none() : PreservedAnalyses::all();
 }
