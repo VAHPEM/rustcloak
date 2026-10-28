@@ -295,6 +295,70 @@ bool makeLazy(Module &M, Function *Helper, const EncTarget &T, const AntiEmu *ae
   return true;
 }
 
+// FNV-1a-32 over bytes; the compile-time chained seed and the runtime fnv helper agree.
+static uint32_t fnv32(const std::vector<uint8_t> &b) {
+  uint32_t h = 2166136261u;
+  for (uint8_t x : b) h = (h ^ x) * 16777619u;
+  return h;
+}
+
+// Runtime FNV-1a-32 over a buffer: i32 fnv(i8* p, i64 len). Chained-key mode derives each string's
+// seed from the PREVIOUS decrypted plaintext, so an isolated emulation (one string at a time, with
+// no prior plaintext) computes the wrong seed and recovers garbage.
+Function *getFnvHelper(Module &M) {
+  LLVMContext &Ctx = M.getContext();
+  if (Function *F = M.getFunction(rustcloak::anon("fnvh")))
+    return F;
+  Type *I8 = Type::getInt8Ty(Ctx), *I32 = Type::getInt32Ty(Ctx), *I64 = Type::getInt64Ty(Ctx);
+  Type *Ptr = PointerType::getUnqual(Ctx);
+  Function *F = Function::Create(FunctionType::get(I32, {Ptr, I64}, false),
+                                 GlobalValue::InternalLinkage, rustcloak::anon("fnvh"), M);
+  Argument *P = F->getArg(0), *Len = F->getArg(1);
+  BasicBlock *E = BasicBlock::Create(Ctx, "entry", F), *C = BasicBlock::Create(Ctx, "cond", F),
+             *Bd = BasicBlock::Create(Ctx, "body", F), *X = BasicBlock::Create(Ctx, "exit", F);
+  IRBuilder<> B(E);
+  AllocaInst *h = B.CreateAlloca(I32), *i = B.CreateAlloca(I64);
+  B.CreateStore(ConstantInt::get(I32, 2166136261u), h);
+  B.CreateStore(ConstantInt::get(I64, 0), i);
+  B.CreateBr(C);
+  B.SetInsertPoint(C);
+  Value *iv = B.CreateLoad(I64, i);
+  B.CreateCondBr(B.CreateICmpULT(iv, Len), Bd, X);
+  B.SetInsertPoint(Bd);
+  Value *by = B.CreateZExt(B.CreateLoad(I8, B.CreateGEP(I8, P, iv)), I32);
+  Value *hv = B.CreateMul(B.CreateXor(B.CreateLoad(I32, h), by), ConstantInt::get(I32, 16777619u));
+  B.CreateStore(hv, h);
+  B.CreateStore(B.CreateAdd(iv, ConstantInt::get(I64, 1)), i);
+  B.CreateBr(C);
+  B.SetInsertPoint(X);
+  B.CreateRet(B.CreateLoad(I32, h));
+  return F;
+}
+
+// Chained eager mode (RUSTCLOAK_STRENC_CHAIN): decrypt in order; string 0 uses its stored seed,
+// each later seed is the FNV hash of the previous (now decrypted) string. Order is mandatory, which
+// defeats recovering any single string by isolated emulation.
+void emitStartupCtorChained(Module &M, Function *Helper, Function *Fnv,
+                            ArrayRef<EncTarget> targets, const AntiEmu *ae) {
+  LLVMContext &Ctx = M.getContext();
+  Function *Ctor = Function::Create(FunctionType::get(Type::getVoidTy(Ctx), false),
+                                    GlobalValue::InternalLinkage, rustcloak::anon("dctor"), M);
+  IRBuilder<> B(BasicBlock::Create(Ctx, "entry", Ctor));
+  Type *I64 = Type::getInt64Ty(Ctx), *Ptr = PointerType::getUnqual(Ctx);
+  Value *prevP = nullptr, *prevLen = nullptr;
+  for (size_t k = 0; k < targets.size(); k++) {
+    const EncTarget &T = targets[k];
+    Value *seedCur = (k == 0) ? seedValue(B, Ctx, T.seed, ae)
+                              : B.CreateCall(Fnv, {prevP, prevLen});
+    Value *P = B.CreateBitCast(T.G, Ptr);
+    B.CreateCall(Helper, {P, ConstantInt::get(I64, T.len), seedCur});
+    prevP = P;
+    prevLen = ConstantInt::get(I64, T.len);
+  }
+  B.CreateRetVoid();
+  appendToGlobalCtors(M, Ctor, ae ? 1 : 0);
+}
+
 } // namespace
 
 PreservedAnalyses StrEncPass::run(Module &M, ModuleAnalysisManager &) {
@@ -303,6 +367,9 @@ PreservedAnalyses StrEncPass::run(Module &M, ModuleAnalysisManager &) {
   bool cipher = std::getenv("RUSTCLOAK_STRENC_CIPHER") != nullptr;
   bool callsite = std::getenv("RUSTCLOAK_STRENC_CALLSITE") != nullptr;
   bool lazy = callsite || std::getenv("RUSTCLOAK_LAZY") != nullptr;  // call-site implies on-use
+  bool chain = std::getenv("RUSTCLOAK_STRENC_CHAIN") != nullptr;
+  if (chain) { cipher = true; lazy = false; }   // chaining needs 32-bit seeds + ordered eager decrypt
+  std::vector<uint8_t> chainPrev; bool chainHave = false;
   std::vector<EncTarget> targets;
 
   for (GlobalVariable &G : M.globals()) {
@@ -336,9 +403,15 @@ PreservedAnalyses StrEncPass::run(Module &M, ModuleAnalysisManager &) {
     if (data.size() < 2 || data.size() > (1u << 16))
       continue;
 
-    // Per-string seed: a full 32-bit odd value in cipher mode, else an odd key byte (low 8 bits).
-    uint32_t seed = cipher ? ((uint32_t)gen() | 1u) : (uint32_t)(uint8_t)(gen() | 1u);
+    // Per-string seed: chained (hash of the previous plaintext) when chaining; else 32-bit odd in
+    // cipher mode, or an odd key byte in linear mode.
+    uint32_t seed;
+    if (chain)
+      seed = chainHave ? fnv32(chainPrev) : ((uint32_t)gen() | 1u);
+    else
+      seed = cipher ? ((uint32_t)gen() | 1u) : (uint32_t)(uint8_t)(gen() | 1u);
     std::vector<uint8_t> enc(data.begin(), data.end());
+    std::vector<uint8_t> plainForChain = enc;   // capture plaintext before xor overwrites it
     xorKeystream(enc, seed, cipher);
     Constant *encArr = ConstantDataArray::get(Ctx, enc);
     G.setInitializer(wrapTy ? ConstantStruct::get(wrapTy, {encArr})
@@ -346,6 +419,7 @@ PreservedAnalyses StrEncPass::run(Module &M, ModuleAnalysisManager &) {
     G.setConstant(false);
     G.setUnnamedAddr(GlobalValue::UnnamedAddr::None); // the writable copy must not be merged
     targets.push_back({&G, seed, enc.size()});
+    if (chain) { chainPrev = std::move(plainForChain); chainHave = true; }
   }
   if (targets.empty())
     return PreservedAnalyses::all();
@@ -402,6 +476,8 @@ PreservedAnalyses StrEncPass::run(Module &M, ModuleAnalysisManager &) {
         deferred.push_back(T);           // not lazifiable -> still encrypted, decrypted eagerly
     if (!deferred.empty())
       emitStartupCtor(M, Helper, deferred, ae);
+  } else if (chain) {
+    emitStartupCtorChained(M, Helper, getFnvHelper(M), targets, ae);
   } else {
     emitStartupCtor(M, Helper, targets, ae);
   }
