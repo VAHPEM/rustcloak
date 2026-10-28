@@ -23,6 +23,7 @@
 #include "llvm/IR/Function.h"
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/Instructions.h"
+#include "llvm/ADT/SmallVector.h"
 
 #include <cstdlib>
 #include <vector>
@@ -88,6 +89,21 @@ static Value *rewrite(BinaryOperator *bo, std::mt19937_64 &gen) {
   }
 }
 
+// Wrap v in an invertible xor-shift permutation round-trip: encode e = v ^ (v<<s), then decode with
+// the doubling inverse of (I + L^s) over GF(2)^w. decode(encode(v)) == v for EVERY v at width w --
+// (I + L^s) is unipotent (L = 1-bit left shift is nilpotent, L^w = 0); its inverse is the geometric
+// series I + L^s + L^2s + ..., and the product form prod_i (I + L^(2^i s)) telescopes to it with all
+// cross terms cancelling in characteristic 2. LLVM does not reason about GF(2) linear algebra, so it
+// cannot fold the round-trip back to v, yet the value is provably unchanged: a permutation-polynomial
+// MBA that never miscompiles. (Exhaustively verified for w in {8,16}; see test/mba_perm.c.)
+static Value *permuteWrap(IRBuilder<> &B, Value *v, unsigned s) {
+  Type *ty = v->getType();
+  unsigned w = ty->getIntegerBitWidth();
+  Value *x = B.CreateXor(v, B.CreateShl(v, ConstantInt::get(ty, s)));   // encode: (I + L^s) v
+  for (unsigned k = s; k < w; k *= 2)                                    // decode: product doubling
+    x = B.CreateXor(x, B.CreateShl(x, ConstantInt::get(ty, k)));
+  return x;                                                              // == v for all inputs
+}
 } // namespace
 
 PreservedAnalyses SubstPass::run(Function &F, FunctionAnalysisManager &) {
@@ -101,12 +117,13 @@ PreservedAnalyses SubstPass::run(Function &F, FunctionAnalysisManager &) {
     depth = depth < 1 ? 1 : (depth > 4 ? 4 : depth);   // bounded so expansion always terminates
   }
 
+  const size_t maxInsts = 20000;
   bool changed = false;
   for (int round = 0; round < depth; round++) {
     size_t n = 0;
     for (BasicBlock &BB : F)
       n += BB.size();
-    if (n > 20000)
+    if (n > maxInsts)
       break;  // Stop expansion of very large functions.
     std::vector<BinaryOperator *> ops;     // snapshot this round's operators (not the ones we create)
     for (BasicBlock &BB : F)
@@ -128,6 +145,43 @@ PreservedAnalyses SubstPass::run(Function &F, FunctionAnalysisManager &) {
     }
     if (!any)
       break;                               // nothing left to expand
+  }
+  // Permutation-polynomial MBA (RUSTCLOAK_MBA_PERM): wrap a random subset of integer results in an
+  // invertible xor-shift round-trip (see permuteWrap). Default off; it compounds with the MBA above
+  // and, unlike constant-coefficient affine encoding, the optimizer cannot fold it away.
+  if (std::getenv("RUSTCLOAK_MBA_PERM")) {
+    size_t budget = 0;
+    for (BasicBlock &BB : F)
+      budget += BB.size();
+    size_t cap = maxInsts > budget ? (maxInsts - budget) / 8 : 0;   // respect the per-function ceiling
+    std::vector<BinaryOperator *> wrap;
+    for (BasicBlock &BB : F)
+      for (Instruction &I : BB)
+        if (auto *bo = dyn_cast<BinaryOperator>(&I))
+          if (bo->getType()->isIntegerTy()) {
+            unsigned w = bo->getType()->getIntegerBitWidth();
+            if (w >= 2 && w <= 64)
+              wrap.push_back(bo);
+          }
+    for (BinaryOperator *I : wrap) {
+      if (!cap)
+        break;
+      if ((gen() & 1u) == 0u)              // wrap about half, for variety
+        continue;
+      SmallVector<Use *, 8> uses;
+      for (Use &U : I->uses())
+        uses.push_back(&U);
+      if (uses.empty())
+        continue;
+      unsigned w = I->getType()->getIntegerBitWidth();
+      unsigned sft = 1u + (unsigned)(gen() % (w - 1));   // 1 <= s <= w-1, so every shift amount < w
+      IRBuilder<> B(I->getNextNode());
+      Value *wv = permuteWrap(B, I, sft);
+      for (Use *U : uses)
+        U->set(wv);                        // redirect only PRE-EXISTING uses; the encode keeps using I
+      changed = true;
+      --cap;
+    }
   }
   return changed ? PreservedAnalyses::none() : PreservedAnalyses::all();
 }
