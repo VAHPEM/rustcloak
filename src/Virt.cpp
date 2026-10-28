@@ -82,11 +82,19 @@ enum Op : uint8_t {
   // interpreter and so references data globals and has stack allocas (both left native at layer 0):
   OP_GLOBAL = 38, // reg[dst] = &globaltable[a]      (address of a referenced data global)
   OP_ALLOCA = 39, // reg[dst] = alloca i8 x pool[a|b<<8]   (a fixed-size stack allocation)
+  // scalar float (f32/f64): the lane holds the value's raw bits. Width code 2=f32, 3=f64.
+  OP_FADD = 40, OP_FSUB = 41, OP_FMUL = 42, OP_FDIV = 43, OP_FNEG = 44,
+  OP_FEQ = 45, OP_FLT = 46, OP_FLE = 47, OP_FGT = 48, OP_FGE = 49, OP_FNE = 50,
+  // conversions: SITOFP/FPTOSI encode (int i32/i64, float f32/f64) in the two width bits
+  // (bit1=int width 0:i32/1:i64, bit0=float width 0:f32/1:f64); FPEXT is f32->f64, FPTRUNC f64->f32.
+  OP_SITOFP = 51, OP_FPTOSI = 52, OP_FPEXT = 53, OP_FPTRUNC = 54,
 };
 
 static uint8_t wcodeOf(unsigned bits) {
   return bits == 8 ? 0 : bits == 16 ? 1 : bits == 32 ? 2 : 3;
 }
+// inverse of wcodeOf: a 2-bit code -> the width whose wcodeOf is that code (for encoding conversions).
+static const unsigned ENCW[4] = {8, 16, 32, 64};
 
 struct VI {
   uint8_t op, dst = 0, a = 0, b = 0;
@@ -123,15 +131,19 @@ static uint8_t cmpBase(CmpInst::Predicate p) {
   }
 }
 
-// A value the VM can hold in an i64 register: a small-enough integer, or a pointer.
+// A value the VM can hold in an i64 register: a small-enough integer, or a pointer. Used for call
+// ABI (integer/pointer args go in integer registers through the uniform thunk) -- NOT widened to
+// float, which would break the ABI of a virtualized call.
 static bool isRegTy(Type *T) {
   return (T->isIntegerTy() && T->getIntegerBitWidth() <= 64) || T->isPointerTy();
 }
+// A value a VM lane can hold: isRegTy plus scalar f32/f64 (kept as raw bits in the lane).
+static bool isLaneTy(Type *T) { return isRegTy(T) || T->isFloatTy() || T->isDoubleTy(); }
 
 static bool okOperand(Value *v, bool allowGlobal = false) {
   if (allowGlobal && isa<GlobalVariable>(v))
     return true;                         // nested layer: data-global address via OP_GLOBAL
-  return isa<Argument>(v) || isa<Instruction>(v) || isa<ConstantInt>(v) ||
+  return isa<Argument>(v) || isa<Instruction>(v) || isa<ConstantInt>(v) || isa<ConstantFP>(v) ||
          isa<UndefValue>(v) || isa<ConstantPointerNull>(v);
 }
 
@@ -261,29 +273,56 @@ static bool eligible(Function &F, bool nested = false) {
   if (F.isDeclaration() || F.isVarArg())
     return false;
   for (Argument &A : F.args())
-    if (!isRegTy(A.getType()))
+    if (!isLaneTy(A.getType()))
       return false;
   for (BasicBlock &BB : F) {
     Instruction *term = BB.getTerminator();
     if (auto *ret = dyn_cast<ReturnInst>(term)) {
       Value *rv = ret->getReturnValue();
-      if (rv && !isRegTy(rv->getType()))
-        return false;                    // int<=64, pointer, or void return
+      if (rv && !isLaneTy(rv->getType()))
+        return false;                    // int<=64, pointer, float, or void return
     } else if (!isa<BranchInst>(term)) {
       return false;
     }
     for (Instruction &I : BB) {
-      if (!I.getType()->isVoidTy() && !isRegTy(I.getType()))
+      if (!I.getType()->isVoidTy() && !isLaneTy(I.getType()))
         return false;
       bool ok = false;
       if (auto *bo = dyn_cast<BinaryOperator>(&I)) {
-        unsigned w = bo->getType()->isIntegerTy() ? bo->getType()->getIntegerBitWidth() : 0;
-        bool bitwise = bo->getOpcode() == Instruction::And ||
-                       bo->getOpcode() == Instruction::Or ||
-                       bo->getOpcode() == Instruction::Xor;
-        // arithmetic/shift must be a standard width (correctly width-decoded); bitwise ops are
-        // correct at any width <= 64 on zero-extended lanes, so boolean i1 and/or/xor stay in.
-        ok = stdWidth(w) || (bitwise && w >= 1 && w <= 64);
+        if (bo->getType()->isFloatTy() || bo->getType()->isDoubleTy()) {
+          unsigned op = bo->getOpcode();        // scalar float arithmetic (bit-identical to native)
+          ok = op == Instruction::FAdd || op == Instruction::FSub ||
+               op == Instruction::FMul || op == Instruction::FDiv;
+        } else {
+          unsigned w = bo->getType()->isIntegerTy() ? bo->getType()->getIntegerBitWidth() : 0;
+          bool bitwise = bo->getOpcode() == Instruction::And ||
+                         bo->getOpcode() == Instruction::Or ||
+                         bo->getOpcode() == Instruction::Xor;
+          // arithmetic/shift must be a standard width (correctly width-decoded); bitwise ops are
+          // correct at any width <= 64 on zero-extended lanes, so boolean i1 and/or/xor stay in.
+          ok = stdWidth(w) || (bitwise && w >= 1 && w <= 64);
+        }
+      } else if (auto *un = dyn_cast<UnaryOperator>(&I)) {
+        ok = un->getOpcode() == Instruction::FNeg &&
+             (un->getType()->isFloatTy() || un->getType()->isDoubleTy());
+      } else if (auto *fc = dyn_cast<FCmpInst>(&I)) {
+        auto pr = fc->getPredicate();
+        bool okp = pr == CmpInst::FCMP_OEQ || pr == CmpInst::FCMP_OLT || pr == CmpInst::FCMP_OLE ||
+                   pr == CmpInst::FCMP_OGT || pr == CmpInst::FCMP_OGE || pr == CmpInst::FCMP_ONE;
+        Type *ot = fc->getOperand(0)->getType();
+        ok = okp && (ot->isFloatTy() || ot->isDoubleTy());
+      } else if (auto *s2f = dyn_cast<SIToFPInst>(&I)) {
+        Type *st = s2f->getOperand(0)->getType(), *dt = s2f->getType();
+        ok = st->isIntegerTy() && (st->getIntegerBitWidth() == 32 || st->getIntegerBitWidth() == 64) &&
+             (dt->isFloatTy() || dt->isDoubleTy());
+      } else if (auto *f2s = dyn_cast<FPToSIInst>(&I)) {
+        Type *st = f2s->getOperand(0)->getType(), *dt = f2s->getType();
+        ok = (st->isFloatTy() || st->isDoubleTy()) && dt->isIntegerTy() &&
+             (dt->getIntegerBitWidth() == 32 || dt->getIntegerBitWidth() == 64);
+      } else if (isa<FPExtInst>(&I)) {
+        ok = I.getOperand(0)->getType()->isFloatTy() && I.getType()->isDoubleTy();
+      } else if (isa<FPTruncInst>(&I)) {
+        ok = I.getOperand(0)->getType()->isDoubleTy() && I.getType()->isFloatTy();
       } else if (auto *ic = dyn_cast<ICmpInst>(&I)) {
         unsigned w = ic->getOperand(0)->getType()->isIntegerTy()
                          ? ic->getOperand(0)->getType()->getIntegerBitWidth() : 0;
@@ -293,7 +332,7 @@ static bool eligible(Function &F, bool nested = false) {
         // compared at 64-bit, which is wrong for signed predicates).
         ok = cmpBase(ic->getPredicate()) && (stdWidth(w) || (w == 1 && eqne));
       } else if (auto *se = dyn_cast<SelectInst>(&I)) {
-        ok = se->getCondition()->getType()->isIntegerTy(1) && isRegTy(se->getType());
+        ok = se->getCondition()->getType()->isIntegerTy(1) && isLaneTy(se->getType());
       } else if (isa<TruncInst>(&I) || isa<ZExtInst>(&I)) {
         // trunc -> AND with a mask (any target width); zext -> MOV (copy of a clean lane).
         ok = I.getType()->isIntegerTy() && I.getOperand(0)->getType()->isIntegerTy();
@@ -312,14 +351,17 @@ static bool eligible(Function &F, bool nested = false) {
           if (it.getStructTypeOrNull() && !isa<ConstantInt>(it.getOperand()))
             ok = false;                  // struct index must be constant (always true in valid IR)
       } else if (auto *ld = dyn_cast<LoadInst>(&I)) {
+        Type *lt = ld->getType();            // float loads reuse the integer load of the same width
         ok = !ld->isAtomic() && !ld->isVolatile() &&
-             ld->getType()->isIntegerTy() && stdWidth(ld->getType()->getIntegerBitWidth());
+             ((lt->isIntegerTy() && stdWidth(lt->getIntegerBitWidth())) ||
+              lt->isFloatTy() || lt->isDoubleTy());
       } else if (auto *st = dyn_cast<StoreInst>(&I)) {
         Type *vt = st->getValueOperand()->getType();
         ok = !st->isAtomic() && !st->isVolatile() &&
-             vt->isIntegerTy() && stdWidth(vt->getIntegerBitWidth());
+             ((vt->isIntegerTy() && stdWidth(vt->getIntegerBitWidth())) ||
+              vt->isFloatTy() || vt->isDoubleTy());
       } else if (isa<PHINode>(&I)) {
-        ok = isRegTy(I.getType());
+        ok = isLaneTy(I.getType());
       } else if (auto *ci = dyn_cast<CallInst>(&I)) {
         ok = virtCallee(ci) != nullptr;
       } else if (auto *al = dyn_cast<AllocaInst>(&I)) {
@@ -531,7 +573,10 @@ static bool virtualizeOnce(Function &F, unsigned layer) {
 
   auto widthOf = [](Value *v) -> unsigned {
     Type *t = v->getType();
-    return t->isIntegerTy() ? t->getIntegerBitWidth() : 64;   // pointers: 64-bit lane
+    if (t->isIntegerTy()) return t->getIntegerBitWidth();
+    if (t->isFloatTy())   return 32;                          // f32 lane width
+    if (t->isDoubleTy())  return 64;                          // f64 lane width
+    return 64;                                                // pointers: 64-bit lane
   };
 
   Prog P;
@@ -543,7 +588,7 @@ static bool virtualizeOnce(Function &F, unsigned layer) {
     for (Instruction &I : BB) {
       if (isa<PHINode>(I))
         nph++;
-      if (!I.isTerminator() && !I.getType()->isVoidTy() && isRegTy(I.getType()))
+      if (!I.isTerminator() && !I.getType()->isVoidTy() && isLaneTy(I.getType()))
         P.slot[&I] = P.nreg++;
     }
     maxPhi = std::max(maxPhi, nph);
@@ -558,9 +603,12 @@ static bool virtualizeOnce(Function &F, unsigned layer) {
   // constants, GEP strides/offsets, and the masks sext/trunc need
   for (BasicBlock &BB : F)
     for (Instruction &I : BB) {
-      for (Value *op : I.operands())
+      for (Value *op : I.operands()) {
         if (auto *ci = dyn_cast<ConstantInt>(op))
           wantConst(ci->getZExtValue());
+        else if (auto *cf = dyn_cast<ConstantFP>(op))
+          wantConst(cf->getValueAPF().bitcastToAPInt().getZExtValue());  // float literal as raw bits
+      }
       if (auto *tr = dyn_cast<TruncInst>(&I)) {
         // A trunc lowers to AND with a width mask; collect that mask HERE, before the OP_CONST ops
         // are emitted below -- a mask first requested during emission would get a register but no
@@ -629,6 +677,8 @@ static bool virtualizeOnce(Function &F, unsigned layer) {
   auto regOf = [&](Value *v) -> unsigned {
     if (auto *ci = dyn_cast<ConstantInt>(v))
       return P.creg[ci->getZExtValue()];
+    if (auto *cf = dyn_cast<ConstantFP>(v))
+      return P.creg[cf->getValueAPF().bitcastToAPInt().getZExtValue()];
     if (isa<UndefValue>(v) || isa<ConstantPointerNull>(v))
       return P.creg[0];
     if (auto *gv = dyn_cast<GlobalVariable>(v))
@@ -700,21 +750,54 @@ static bool virtualizeOnce(Function &F, unsigned layer) {
     for (Instruction &I : *BB) {
       if (isa<PHINode>(I) || I.isTerminator())
         continue;
-      unsigned d = (!I.getType()->isVoidTy() && isRegTy(I.getType())) ? regOf(&I) : 0;
+      unsigned d = (!I.getType()->isVoidTy() && isLaneTy(I.getType())) ? regOf(&I) : 0;
       if (auto *bo = dyn_cast<BinaryOperator>(&I)) {
-        static const DenseMap<unsigned, uint8_t> M = {
-          {Instruction::Add, OP_ADD}, {Instruction::Sub, OP_SUB}, {Instruction::Mul, OP_MUL},
-          {Instruction::And, OP_AND}, {Instruction::Or, OP_OR}, {Instruction::Xor, OP_XOR},
-          {Instruction::Shl, OP_SHL}, {Instruction::LShr, OP_LSHR}, {Instruction::AShr, OP_ASHR},
-          {Instruction::UDiv, OP_UDIV}, {Instruction::SDiv, OP_SDIV},
-          {Instruction::URem, OP_UREM}, {Instruction::SRem, OP_SREM}};
-        auto f = M.find(bo->getOpcode());
-        if (f == M.end())
-          return false;
-        emit(f->second, widthOf(bo), d, regOf(bo->getOperand(0)), regOf(bo->getOperand(1)));
+        if (bo->getType()->isFloatTy() || bo->getType()->isDoubleTy()) {
+          static const DenseMap<unsigned, uint8_t> FM = {
+            {Instruction::FAdd, OP_FADD}, {Instruction::FSub, OP_FSUB},
+            {Instruction::FMul, OP_FMUL}, {Instruction::FDiv, OP_FDIV}};
+          auto f = FM.find(bo->getOpcode());
+          if (f == FM.end())
+            return false;
+          emit(f->second, widthOf(bo), d, regOf(bo->getOperand(0)), regOf(bo->getOperand(1)));
+        } else {
+          static const DenseMap<unsigned, uint8_t> M = {
+            {Instruction::Add, OP_ADD}, {Instruction::Sub, OP_SUB}, {Instruction::Mul, OP_MUL},
+            {Instruction::And, OP_AND}, {Instruction::Or, OP_OR}, {Instruction::Xor, OP_XOR},
+            {Instruction::Shl, OP_SHL}, {Instruction::LShr, OP_LSHR}, {Instruction::AShr, OP_ASHR},
+            {Instruction::UDiv, OP_UDIV}, {Instruction::SDiv, OP_SDIV},
+            {Instruction::URem, OP_UREM}, {Instruction::SRem, OP_SREM}};
+          auto f = M.find(bo->getOpcode());
+          if (f == M.end())
+            return false;
+          emit(f->second, widthOf(bo), d, regOf(bo->getOperand(0)), regOf(bo->getOperand(1)));
+        }
+      } else if (auto *un = dyn_cast<UnaryOperator>(&I)) {    // FNeg
+        emit(OP_FNEG, widthOf(un), d, regOf(un->getOperand(0)), 0);
       } else if (auto *ic = dyn_cast<ICmpInst>(&I)) {
         emit(cmpBase(ic->getPredicate()), widthOf(ic->getOperand(0)), d,
              regOf(ic->getOperand(0)), regOf(ic->getOperand(1)));
+      } else if (auto *fc = dyn_cast<FCmpInst>(&I)) {
+        static const DenseMap<unsigned, uint8_t> FC = {
+          {CmpInst::FCMP_OEQ, OP_FEQ}, {CmpInst::FCMP_OLT, OP_FLT}, {CmpInst::FCMP_OLE, OP_FLE},
+          {CmpInst::FCMP_OGT, OP_FGT}, {CmpInst::FCMP_OGE, OP_FGE}, {CmpInst::FCMP_ONE, OP_FNE}};
+        auto f = FC.find(fc->getPredicate());
+        if (f == FC.end())
+          return PreservedAnalyses::all();
+        emit(f->second, widthOf(fc->getOperand(0)), d,
+             regOf(fc->getOperand(0)), regOf(fc->getOperand(1)));
+      } else if (auto *s2f = dyn_cast<SIToFPInst>(&I)) {
+        unsigned enc = (s2f->getOperand(0)->getType()->getIntegerBitWidth() == 64 ? 2u : 0u) |
+                       (s2f->getType()->isDoubleTy() ? 1u : 0u);
+        emit(OP_SITOFP, ENCW[enc], d, regOf(s2f->getOperand(0)), 0);
+      } else if (auto *f2s = dyn_cast<FPToSIInst>(&I)) {
+        unsigned enc = (f2s->getType()->getIntegerBitWidth() == 64 ? 2u : 0u) |
+                       (f2s->getOperand(0)->getType()->isDoubleTy() ? 1u : 0u);
+        emit(OP_FPTOSI, ENCW[enc], d, regOf(f2s->getOperand(0)), 0);
+      } else if (isa<FPExtInst>(&I)) {
+        emit(OP_FPEXT, 64, d, regOf(I.getOperand(0)), 0);
+      } else if (isa<FPTruncInst>(&I)) {
+        emit(OP_FPTRUNC, 64, d, regOf(I.getOperand(0)), 0);
       } else if (auto *se = dyn_cast<SelectInst>(&I)) {
         emit(OP_MOV, 64, d, regOf(se->getFalseValue()), 0);
         emit(OP_CMOVNZ, 64, d, regOf(se->getCondition()), regOf(se->getTrueValue()));
@@ -731,10 +814,13 @@ static bool virtualizeOnce(Function &F, unsigned layer) {
       } else if (auto *gep = dyn_cast<GetElementPtrInst>(&I)) {
         lowerGEP(gep, d);
       } else if (auto *ld = dyn_cast<LoadInst>(&I)) {
-        emit(OP_LOAD, ld->getType()->getIntegerBitWidth(), d, regOf(ld->getPointerOperand()), 0);
+        Type *lt = ld->getType();
+        unsigned lw = lt->isIntegerTy() ? lt->getIntegerBitWidth() : (lt->isFloatTy() ? 32u : 64u);
+        emit(OP_LOAD, lw, d, regOf(ld->getPointerOperand()), 0);   // float: load the bits (same width)
       } else if (auto *st = dyn_cast<StoreInst>(&I)) {
-        emit(OP_STORE, st->getValueOperand()->getType()->getIntegerBitWidth(), 0,
-             regOf(st->getPointerOperand()), regOf(st->getValueOperand()));
+        Type *vt = st->getValueOperand()->getType();
+        unsigned sw = vt->isIntegerTy() ? vt->getIntegerBitWidth() : (vt->isFloatTy() ? 32u : 64u);
+        emit(OP_STORE, sw, 0, regOf(st->getPointerOperand()), regOf(st->getValueOperand()));
       } else if (auto *ci = dyn_cast<CallInst>(&I)) {
         for (Value *a : ci->args())          // stage each argument, then call
           emit(OP_PUSHARG, 64, 0, regOf(a), 0);
@@ -851,8 +937,13 @@ static bool virtualizeOnce(Function &F, unsigned layer) {
   auto regGEP = [&](Value *idx) { return B.CreateGEP(regsTy, regs, {B.getInt64(0), idx}); };
   for (unsigned i = 0; i < args.size(); i++) {
     Value *v = args[i];
-    if (v->getType()->isPointerTy())
+    Type *at = v->getType();
+    if (at->isPointerTy())
       v = B.CreatePtrToInt(v, i64);
+    else if (at->isFloatTy())
+      v = B.CreateZExt(B.CreateBitCast(v, Type::getInt32Ty(Ctx)), i64);  // f32 bits in the lane
+    else if (at->isDoubleTy())
+      v = B.CreateBitCast(v, i64);                                       // f64 bits in the lane
     else
       v = B.CreateZExt(v, i64);
     B.CreateStore(v, regGEP(B.getInt64(P.slot[args[i]])));
@@ -971,6 +1062,10 @@ static bool virtualizeOnce(Function &F, unsigned layer) {
       Value *v = loadReg(ra);
       if (retTy->isPointerTy())
         v = B.CreateIntToPtr(v, retTy);   // the lane holds the address; hand back a pointer
+      else if (retTy->isFloatTy())
+        v = B.CreateBitCast(B.CreateTrunc(v, Type::getInt32Ty(Ctx)), retTy);
+      else if (retTy->isDoubleTy())
+        v = B.CreateBitCast(v, retTy);
       else if (retTy->isIntegerTy() && retTy->getIntegerBitWidth() < 64)
         v = B.CreateTrunc(v, retTy);
       B.CreateRet(v);
@@ -1045,6 +1140,82 @@ static bool virtualizeOnce(Function &F, unsigned layer) {
     if (base == OP_STORE) {
       Value *p = B.CreateIntToPtr(loadReg(ra), PointerType::get(Ctx, 0));
       B.CreateStore(B.CreateTrunc(loadReg(rb), iW), p);
+      finish(pc4);
+      continue;
+    }
+    // ---- scalar floating point (lane holds raw bits; wbits 32=f32, 64=f64) ---------------------
+    if (base == OP_FADD || base == OP_FSUB || base == OP_FMUL || base == OP_FDIV ||
+        base == OP_FNEG) {
+      Type *fTy = (wbits == 32) ? Type::getFloatTy(Ctx) : Type::getDoubleTy(Ctx);
+      auto toF = [&](Value *lane) {
+        return B.CreateBitCast(
+            wbits == 32 ? (Value *)B.CreateTrunc(lane, Type::getInt32Ty(Ctx)) : lane, fTy);
+      };
+      Value *fa = toF(loadReg(ra)), *r;
+      if (base == OP_FNEG)
+        r = B.CreateFNeg(fa);
+      else {
+        Value *fb = toF(loadReg(rb));
+        r = base == OP_FADD ? B.CreateFAdd(fa, fb)
+          : base == OP_FSUB ? B.CreateFSub(fa, fb)
+          : base == OP_FMUL ? B.CreateFMul(fa, fb)
+                            : B.CreateFDiv(fa, fb);
+      }
+      Value *bits = B.CreateBitCast(r, IntegerType::get(Ctx, wbits));
+      storeReg(dst, wbits == 32 ? B.CreateZExt(bits, i64) : bits);
+      finish(pc4);
+      continue;
+    }
+    if (base == OP_FEQ || base == OP_FLT || base == OP_FLE || base == OP_FGT ||
+        base == OP_FGE || base == OP_FNE) {
+      Type *fTy = (wbits == 32) ? Type::getFloatTy(Ctx) : Type::getDoubleTy(Ctx);
+      auto toF = [&](Value *lane) {
+        return B.CreateBitCast(
+            wbits == 32 ? (Value *)B.CreateTrunc(lane, Type::getInt32Ty(Ctx)) : lane, fTy);
+      };
+      CmpInst::Predicate p = base == OP_FEQ ? CmpInst::FCMP_OEQ
+                           : base == OP_FLT ? CmpInst::FCMP_OLT
+                           : base == OP_FLE ? CmpInst::FCMP_OLE
+                           : base == OP_FGT ? CmpInst::FCMP_OGT
+                           : base == OP_FGE ? CmpInst::FCMP_OGE
+                                            : CmpInst::FCMP_ONE;
+      storeReg(dst, B.CreateZExt(B.CreateFCmp(p, toF(loadReg(ra)), toF(loadReg(rb))), i64));
+      finish(pc4);
+      continue;
+    }
+    if (base == OP_FPEXT) {                 // f32 lane -> f64 lane
+      Value *f = B.CreateBitCast(B.CreateTrunc(loadReg(ra), Type::getInt32Ty(Ctx)),
+                                 Type::getFloatTy(Ctx));
+      storeReg(dst, B.CreateBitCast(B.CreateFPExt(f, Type::getDoubleTy(Ctx)), i64));
+      finish(pc4);
+      continue;
+    }
+    if (base == OP_FPTRUNC) {               // f64 lane -> f32 lane
+      Value *dv = B.CreateFPTrunc(B.CreateBitCast(loadReg(ra), Type::getDoubleTy(Ctx)),
+                                  Type::getFloatTy(Ctx));
+      storeReg(dst, B.CreateZExt(B.CreateBitCast(dv, Type::getInt32Ty(Ctx)), i64));
+      finish(pc4);
+      continue;
+    }
+    if (base == OP_SITOFP) {                // wc: bit1 srcInt(0=i32,1=i64), bit0 dstFloat(0=f32,1=f64)
+      unsigned wc = (ob >> 6) & 3;
+      bool srcI64 = wc & 2, dstF64 = wc & 1;
+      Value *iv = srcI64 ? loadReg(ra)
+                         : (Value *)B.CreateTrunc(loadReg(ra), Type::getInt32Ty(Ctx));
+      Value *fv = B.CreateSIToFP(iv, dstF64 ? Type::getDoubleTy(Ctx) : Type::getFloatTy(Ctx));
+      Value *bits = B.CreateBitCast(fv, IntegerType::get(Ctx, dstF64 ? 64 : 32));
+      storeReg(dst, dstF64 ? bits : B.CreateZExt(bits, i64));
+      finish(pc4);
+      continue;
+    }
+    if (base == OP_FPTOSI) {                // wc: bit1 dstInt(0=i32,1=i64), bit0 srcFloat(0=f32,1=f64)
+      unsigned wc = (ob >> 6) & 3;
+      bool dstI64 = wc & 2, srcF64 = wc & 1;
+      Value *fv = B.CreateBitCast(
+          srcF64 ? loadReg(ra) : (Value *)B.CreateTrunc(loadReg(ra), Type::getInt32Ty(Ctx)),
+          srcF64 ? Type::getDoubleTy(Ctx) : Type::getFloatTy(Ctx));
+      Value *iv = B.CreateFPToSI(fv, IntegerType::get(Ctx, dstI64 ? 64 : 32));
+      storeReg(dst, dstI64 ? iv : B.CreateZExt(iv, i64));
       finish(pc4);
       continue;
     }

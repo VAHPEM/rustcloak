@@ -49,6 +49,8 @@ else
   echo "  OK   strenc leak: no plaintext marker in obfuscated binary"
 fi
 
+prog_check floats      "$CLANG"   test/corpus/floats.c        ""
+
 echo "== virt differential fuzz (short) =="
 SECS=${SECS:-30} PLUGIN="$(pwd)/$PLUGIN" bash test/fuzz/difffuzz_vm.sh 2>&1 | sed 's/^/  /'
 
