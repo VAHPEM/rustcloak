@@ -208,7 +208,12 @@ void expandConstantUsers(GlobalVariable *G) {
         Instruction *ip = I;
         if (auto *PN = dyn_cast<PHINode>(I))
           ip = PN->getIncomingBlock(CU)->getTerminator();
+#if LLVM_VERSION_MAJOR >= 21
+        Instruction *ni = CE->getAsInstruction();
+        ni->insertBefore(ip->getIterator());
+#else
         Instruction *ni = CE->getAsInstruction(ip);
+#endif
         CU.set(ni);
         changed = true;
       }

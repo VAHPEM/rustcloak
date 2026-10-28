@@ -8,6 +8,13 @@
 
 using namespace llvm;
 
+// registerOptimizerLastEPCallback gained a ThinOrFullLTOPhase parameter around LLVM 20.
+#if LLVM_VERSION_MAJOR >= 20
+#define RC_OPTLAST_EXTRA , llvm::ThinOrFullLTOPhase
+#else
+#define RC_OPTLAST_EXTRA
+#endif
+
 // The build seed comes from the RUSTCLOAK_SEED environment variable (see RustCloak.h); no LLVM
 // command-line option is registered, so the plugin pulls in no `llvm::cl::` symbols and loads
 // cleanly into any host LLVM of the matching major version, rustc's -Zllvm-plugins included.
@@ -46,7 +53,7 @@ llvm::PassPluginLibraryInfo getRustCloakPluginInfo() {
             // (clang -O2 -fpass-plugin=...) obfuscates at the END, so the optimizer's
             // own passes cannot undo it. RUSTCLOAK_OFF=1 disables this.
             PB.registerOptimizerLastEPCallback(
-                [](ModulePassManager &MPM, OptimizationLevel) {
+                [](ModulePassManager &MPM, OptimizationLevel RC_OPTLAST_EXTRA) {
                   if (getenv("RUSTCLOAK_OFF"))
                     return;
                   MPM.addPass(StrEncPass());

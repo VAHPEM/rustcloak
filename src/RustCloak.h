@@ -19,6 +19,7 @@
 #define RUSTCLOAK_H
 
 #include "llvm/IR/PassManager.h"
+#include "llvm/Config/llvm-config.h"
 
 #include <cstdint>
 #include <cstdlib>
@@ -83,7 +84,7 @@ inline std::mt19937_64 rng(llvm::StringRef tag) {
 // stable name within a build (globals reused by tag still resolve) and differs across builds.
 // Local values and blocks get no name at all (LLVM auto-numbers them) -- see the passes.
 inline std::string anon(llvm::StringRef tag) {
-  auto g = rng(("name:" + tag).str());
+  auto g = rng("name:" + tag.str());
   static const char lead[] = "abcdefghijklmnopqrstuvwxyz";
   static const char body[] = "abcdefghijklmnopqrstuvwxyz0123456789";
   std::string s(1, lead[g() % 26]);
