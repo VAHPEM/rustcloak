@@ -488,7 +488,7 @@ static bool virtualizeOnce(Function &F, unsigned layer) {
   // share no instruction set.
   std::mt19937_64 encRng =
       rustcloak::rng(("vmenc:" + std::to_string(layer) + ":" + F.getName()).str());
-  const unsigned NBASE = OP_ALLOCA + 1;  // logical bases 0..OP_ALLOCA
+  const unsigned NBASE = OP_FPTRUNC + 1;  // all integer, nested, and float opcodes
   auto weightOf = [](unsigned b) -> unsigned {
     switch (b) {
     case OP_MOV: case OP_CONST: case OP_ADD: case OP_SUB:
@@ -783,7 +783,7 @@ static bool virtualizeOnce(Function &F, unsigned layer) {
           {CmpInst::FCMP_OGT, OP_FGT}, {CmpInst::FCMP_OGE, OP_FGE}, {CmpInst::FCMP_ONE, OP_FNE}};
         auto f = FC.find(fc->getPredicate());
         if (f == FC.end())
-          return PreservedAnalyses::all();
+          return false;
         emit(f->second, widthOf(fc->getOperand(0)), d,
              regOf(fc->getOperand(0)), regOf(fc->getOperand(1)));
       } else if (auto *s2f = dyn_cast<SIToFPInst>(&I)) {
