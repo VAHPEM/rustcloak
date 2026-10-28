@@ -18,6 +18,7 @@ add_library(RustCloak MODULE
   src/Subst.cpp
   src/Bogus.cpp
   src/Virt.cpp
+  src/ConstEnc.cpp
   src/Plugin.cpp)
 target_include_directories(RustCloak PRIVATE src)
 # LLVM is normally built without RTTI; match it or the plugin fails to load.

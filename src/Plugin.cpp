@@ -16,6 +16,7 @@ using namespace llvm;
 // itself substituted, given bogus flow and flattened), then substitute, add bogus flow, flatten.
 static void addFunctionTransforms(FunctionPassManager &FPM) {
   FPM.addPass(VirtPass());
+  FPM.addPass(ConstEncPass());
   FPM.addPass(SubstPass());
   FPM.addPass(BogusPass());
   FPM.addPass(FlattenPass());
@@ -32,6 +33,7 @@ llvm::PassPluginLibraryInfo getRustCloakPluginInfo() {
                   if (Name == "subst")   { FPM.addPass(SubstPass());   return true; }
                   if (Name == "bogus")   { FPM.addPass(BogusPass());   return true; }
                   if (Name == "virt")    { FPM.addPass(VirtPass());    return true; }
+                  if (Name == "constenc") { FPM.addPass(ConstEncPass()); return true; }
                   return false;
                 });
             PB.registerPipelineParsingCallback(

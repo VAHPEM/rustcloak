@@ -115,5 +115,9 @@ struct VirtPass : llvm::PassInfoMixin<VirtPass> {
   llvm::PreservedAnalyses run(llvm::Function &F, llvm::FunctionAnalysisManager &);
   static bool isRequired() { return true; }
 };
+struct ConstEncPass : llvm::PassInfoMixin<ConstEncPass> {
+  llvm::PreservedAnalyses run(llvm::Function &F, llvm::FunctionAnalysisManager &);
+  static bool isRequired() { return true; }
+};
 
 #endif // RUSTCLOAK_H
