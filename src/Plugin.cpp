@@ -47,6 +47,7 @@ llvm::PassPluginLibraryInfo getRustCloakPluginInfo() {
                 [](StringRef Name, ModulePassManager &MPM,
                    ArrayRef<PassBuilder::PipelineElement>) {
                   if (Name == "strenc") { MPM.addPass(StrEncPass()); return true; }
+                  if (Name == "antitamper") { MPM.addPass(AntiTamperPass()); return true; }
                   return false;
                 });
             // Automatic: loading the plugin into a default -O pipeline
@@ -60,6 +61,9 @@ llvm::PassPluginLibraryInfo getRustCloakPluginInfo() {
                   FunctionPassManager FPM;
                   addFunctionTransforms(FPM);
                   MPM.addPass(createModuleToFunctionPassAdaptor(std::move(FPM)));
+                  // anti-tamper LAST: section + rc_k-keyed constants over the final code, so it does
+                  // not shrink virt eligibility (RUSTCLOAK_ANTITAMPER; needs the post-link patcher).
+                  MPM.addPass(AntiTamperPass());
                 });
           }};
 }
