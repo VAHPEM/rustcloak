@@ -41,8 +41,29 @@ GlobalVariable *internalI32(Module &M, StringRef name) {
 // track -- and an analyst must reason about the function's own dataflow to see it is always true.
 // Several families are mixed per block (seed-chosen) so no single shape can be pattern-matched;
 // each reduces to a parity identity true for every 32-bit x (verified with z3).
-Value *opaqueTrueFrom(IRBuilder<> &B, Value *x, std::mt19937_64 &gen) {
+Value *opaqueTrueFrom(IRBuilder<> &B, Value *x, Value *y, std::mt19937_64 &gen) {
   Value *zero = B.getInt32(0), *one = B.getInt32(1);
+  // Two-variable families when a second independent in-scope value exists: these depend on BOTH x
+  // and y, so a solver cannot reduce them to a single-variable parity identity. Each is always true
+  // for all 32-bit x,y, built on the x*(x+1)-is-even trick that survives -O2 (z3-checked).
+  if (y) {
+    switch (gen() % 3) {
+    case 0: {                             // (x*(x+1) + y*(y+1)) & 1 == 0  (sum of two evens)
+      Value *px = B.CreateMul(x, B.CreateAdd(x, one));
+      Value *py = B.CreateMul(y, B.CreateAdd(y, one));
+      return B.CreateICmpEQ(B.CreateAnd(B.CreateAdd(px, py), one), zero, "");
+    }
+    case 1: {                             // (y * x*(x+1)) & 1 == 0  (y times an even)
+      Value *px = B.CreateMul(x, B.CreateAdd(x, one));
+      return B.CreateICmpEQ(B.CreateAnd(B.CreateMul(y, px), one), zero, "");
+    }
+    default: {                            // low bit of x*(x+1) equals low bit of y*(y+1) (both 0)
+      Value *px = B.CreateAnd(B.CreateMul(x, B.CreateAdd(x, one)), one);
+      Value *py = B.CreateAnd(B.CreateMul(y, B.CreateAdd(y, one)), one);
+      return B.CreateICmpEQ(px, py, "");
+    }
+    }
+  }
   switch (gen() % 5) {
   case 0: {                               // (x*(x+1)) & 1 == 0
     Value *p = B.CreateMul(x, B.CreateAdd(x, one));
@@ -99,6 +120,21 @@ Value *liveIntUsedIn(BasicBlock *head, BasicBlock *tail) {
   return nullptr;
 }
 
+// A SECOND real, dominating i32 distinct from realSeed's (the second integer argument), for the
+// two-variable opaque predicates; nullptr when the function has fewer than two integer arguments.
+Value *realSeed2(IRBuilder<> &B, Function *F) {
+  int seen = 0;
+  for (Argument &A : F->args())
+    if (A.getType()->isIntegerTy()) {
+      if (seen++ == 0) continue;          // skip the first (realSeed's)
+      unsigned w = A.getType()->getIntegerBitWidth();
+      if (w == 32) return &A;
+      if (w > 32)  return B.CreateTrunc(&A, B.getInt32Ty());
+      return B.CreateZExt(&A, B.getInt32Ty());
+    }
+  return nullptr;
+}
+
 bool bogusBlock(BasicBlock *BB, Module &M, std::mt19937_64 &gen) {
   if (BB->isEHPad() || isa<PHINode>(BB->getTerminator()))
     return false;
@@ -122,9 +158,12 @@ bool bogusBlock(BasicBlock *BB, Module &M, std::mt19937_64 &gen) {
   // Seed the opaque predicate from a real in-scope value when one exists (unfoldable, tied to the
   // function's own data); otherwise fall back to the module-internal global.
   Value *x = realSeed(B, BB->getParent());
+  Value *y = nullptr;
   if (!x)
     x = B.CreateLoad(Type::getInt32Ty(M.getContext()), internalI32(M, rustcloak::anon("ox")), "");
-  Value *cond = opaqueTrueFrom(B, x, gen);
+  else
+    y = realSeed2(B, BB->getParent());   // a second argument -> two-variable predicate when present
+  Value *cond = opaqueTrueFrom(B, x, y, gen);
 
   Type *I32 = Type::getInt32Ty(M.getContext());
   BasicBlock *bogus = BasicBlock::Create(M.getContext(), "", BB->getParent(), tail);

@@ -26,16 +26,23 @@ using namespace llvm;
 
 namespace {
 
-// An opaque zero of type `ty`, from a dominating value `xBase` cast to `ty`: (x*(x+1)) & 1 == 0.
-Value *opaqueZero(IRBuilder<> &B, Value *xBase, Type *ty) {
-  Value *x = xBase;
-  unsigned w = ty->getIntegerBitWidth(), xw = x->getType()->getIntegerBitWidth();
-  if (xw > w)
-    x = B.CreateTrunc(x, ty);
-  else if (xw < w)
-    x = B.CreateZExt(x, ty);
+// (v*(v+1)) & 1, cast to `ty` -- exactly 0 for every v (two consecutive integers, one is even) at
+// any width, and unfoldable (KnownBits does not track the consecutive-integer correlation).
+Value *parityZero(IRBuilder<> &B, Value *v, Type *ty) {
+  unsigned w = ty->getIntegerBitWidth(), vw = v->getType()->getIntegerBitWidth();
+  if (vw > w)      v = B.CreateTrunc(v, ty);
+  else if (vw < w) v = B.CreateZExt(v, ty);
   Value *one = ConstantInt::get(ty, 1);
-  return B.CreateAnd(B.CreateMul(x, B.CreateAdd(x, one)), one);
+  return B.CreateAnd(B.CreateMul(v, B.CreateAdd(v, one)), one);
+}
+
+// An opaque zero of type `ty`. With a second independent value it is `pz(x) | pz(y)` -- still
+// exactly 0, but dependent on two variables so it cannot be reduced to one parity identity.
+Value *opaqueZero(IRBuilder<> &B, Value *xBase, Value *yBase, Type *ty) {
+  Value *z = parityZero(B, xBase, ty);
+  if (yBase)
+    z = B.CreateOr(z, parityZero(B, yBase, ty));
+  return z;
 }
 
 } // namespace
@@ -45,11 +52,11 @@ PreservedAnalyses ConstEncPass::run(Function &F, FunctionAnalysisManager &) {
     return PreservedAnalyses::all();
 
   // A real, dominating integer seed: an integer function argument (arguments dominate everything).
-  Argument *seed = nullptr;
+  Argument *seed = nullptr, *seed2 = nullptr;
   for (Argument &A : F.args())
     if (A.getType()->isIntegerTy()) {
-      seed = &A;
-      break;
+      if (!seed) seed = &A;
+      else { seed2 = &A; break; }
     }
   if (!seed)
     return PreservedAnalyses::all();
@@ -77,7 +84,7 @@ PreservedAnalyses ConstEncPass::run(Function &F, FunctionAnalysisManager &) {
     Instruction *I = w.first;
     auto *ci = cast<ConstantInt>(I->getOperand(w.second));
     IRBuilder<> B(I);
-    Value *hidden = B.CreateXor(ci, opaqueZero(B, seed, ci->getType()));
+    Value *hidden = B.CreateXor(ci, opaqueZero(B, seed, seed2, ci->getType()));
     I->setOperand(w.second, hidden);
     changed = true;
   }
