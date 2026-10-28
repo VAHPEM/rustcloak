@@ -124,5 +124,9 @@ struct AntiTamperPass : llvm::PassInfoMixin<AntiTamperPass> {
   llvm::PreservedAnalyses run(llvm::Module &M, llvm::ModuleAnalysisManager &);
   static bool isRequired() { return true; }
 };
+struct PartialOutlinePass : llvm::PassInfoMixin<PartialOutlinePass> {
+  llvm::PreservedAnalyses run(llvm::Function &F, llvm::FunctionAnalysisManager &);
+  static bool isRequired() { return true; }
+};
 
 #endif // RUSTCLOAK_H

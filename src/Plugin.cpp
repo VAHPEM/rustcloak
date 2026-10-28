@@ -41,6 +41,7 @@ llvm::PassPluginLibraryInfo getRustCloakPluginInfo() {
                   if (Name == "bogus")   { FPM.addPass(BogusPass());   return true; }
                   if (Name == "virt")    { FPM.addPass(VirtPass());    return true; }
                   if (Name == "constenc") { FPM.addPass(ConstEncPass()); return true; }
+                  if (Name == "partial")  { FPM.addPass(PartialOutlinePass()); return true; }
                   return false;
                 });
             PB.registerPipelineParsingCallback(
@@ -58,6 +59,12 @@ llvm::PassPluginLibraryInfo getRustCloakPluginInfo() {
                   if (getenv("RUSTCLOAK_OFF"))
                     return;
                   MPM.addPass(StrEncPass());
+                  // Partial block-level virtualization runs as its OWN adaptor first, so every
+                  // outlined function exists before the virt stage and gets virtualized there
+                  // (RUSTCLOAK_VM_PARTIAL; no-op otherwise).
+                  FunctionPassManager PFP;
+                  PFP.addPass(PartialOutlinePass());
+                  MPM.addPass(createModuleToFunctionPassAdaptor(std::move(PFP)));
                   FunctionPassManager FPM;
                   addFunctionTransforms(FPM);
                   MPM.addPass(createModuleToFunctionPassAdaptor(std::move(FPM)));

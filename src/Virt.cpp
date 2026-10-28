@@ -41,11 +41,14 @@
 #include "llvm/Support/Alignment.h"
 #include "llvm/Transforms/Utils/BasicBlockUtils.h"
 #include "llvm/Transforms/Utils/Cloning.h"
+#include "llvm/Transforms/Utils/CodeExtractor.h"
+#include "llvm/IR/Dominators.h"
 
 #include <algorithm>
 #include <array>
 #include <cctype>
 #include <cstdlib>
+#include <map>
 #include <numeric>
 #include <string>
 #include <vector>
@@ -93,7 +96,9 @@ struct VI {
 struct Prog {
   std::vector<uint64_t> consts;
   DenseMap<Value *, unsigned> slot;
-  DenseMap<uint64_t, unsigned> cpoolIdx, creg;
+  // uint64_t-keyed: std::map (not DenseMap) because the constant value may be ~0ull or ~0ull-1,
+  // which are DenseMap's reserved empty/tombstone keys -- an i64 -1/-2 literal would assert.
+  std::map<uint64_t, unsigned> cpoolIdx, creg;
   std::vector<unsigned> temps;          // PHI copy temporaries
   unsigned gepTmp = 0;                   // one scratch reg for GEP address arithmetic
   unsigned nreg = 0;
@@ -378,6 +383,49 @@ static void inlineTinyCallees(Function &F) {
         break;
     }
   }
+}
+
+// Partial (block-level) virtualization (RUSTCLOAK_VM_PARTIAL): for a function that is NOT wholly
+// virt-eligible, outline ONE clean, single-successor block region into its own internal function
+// with LLVM's CodeExtractor. The virt pass then virtualizes that outlined function (if it passes
+// eligibility), so a PART of a function that would otherwise stay entirely native runs under the VM.
+// CodeExtractor is semantics-preserving and the virt pass still gates on eligible(), so this is
+// correctness-safe by construction regardless of which block is chosen; the worst case is an outlined
+// function that stays native (no benefit, no harm). The region is kept simple -- a non-entry block
+// with an unconditional-branch terminator, no PHIs, no allocas/invokes, >=4 real instructions -- so
+// the outlined function returns void with scalar/pointer in/out parameters the VM already handles.
+static Function *outlineEligibleRegion(Function &F) {
+  DominatorTree DT(F);
+  for (BasicBlock &BB : F) {
+    if (&BB == &F.getEntryBlock() || BB.isEHPad())
+      continue;
+    auto *br = dyn_cast<BranchInst>(BB.getTerminator());
+    if (!br || !br->isUnconditional())        // single successor -> outlined fn returns void
+      continue;
+    if (isa<PHINode>(BB.front()))             // avoid region-entry PHIs
+      continue;
+    unsigned n = 0;
+    bool bad = false;
+    for (Instruction &I : BB) {
+      if (I.isTerminator())
+        continue;
+      if (isa<AllocaInst>(I) || I.isEHPad() || isa<InvokeInst>(I)) { bad = true; break; }
+      n++;
+    }
+    if (bad || n < 4)
+      continue;
+    SmallVector<BasicBlock *, 1> rb{&BB};
+    CodeExtractor CE(rb, &DT);
+    if (!CE.isEligible())
+      continue;
+    CodeExtractorAnalysisCache CEAC(F);
+    if (Function *G = CE.extractCodeRegion(CEAC)) {
+      G->setLinkage(GlobalValue::InternalLinkage);
+      G->addFnAttr("rc-outlined");            // so PartialOutlinePass does not re-process it
+      return G;
+    }
+  }
+  return nullptr;
 }
 
 } // namespace
@@ -1120,4 +1168,12 @@ static void prepareForRevirt(Function &F) {
       sws.push_back(sw);
   for (SwitchInst *sw : sws)
     lowerSwitch(sw);
+}
+
+PreservedAnalyses PartialOutlinePass::run(Function &F, FunctionAnalysisManager &) {
+  if (!getenv("RUSTCLOAK_VM") || !getenv("RUSTCLOAK_VM_PARTIAL") || F.isDeclaration())
+    return PreservedAnalyses::all();
+  if (F.hasFnAttribute("rc-outlined") || eligible(F))
+    return PreservedAnalyses::all();          // already outlined, or wholly handled by the virt pass
+  return outlineEligibleRegion(F) ? PreservedAnalyses::none() : PreservedAnalyses::all();
 }
