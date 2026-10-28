@@ -24,15 +24,20 @@ for t in aarch64-linux-gnu x86_64-linux-gnu x86_64-pc-windows-msvc x86_64-apple-
 done
 
 echo "== behavioural differential (static freestanding ELF; exit-code checksum) =="
-run_arch() { # triple runner-cmd
-  local t=$1 run=${2:-}
-  $CLANG -O2 --target=$t -ffreestanding -nostdlib -static -fuse-ld=lld "$SRC" "$DRV" -o /tmp/b 2>/dev/null \
-    || { printf "  %-24s baseline build fail\n" "$t"; return; }
-  RUSTCLOAK_VM=1 $CLANG -O2 --target=$t -ffreestanding -nostdlib -static -fuse-ld=lld -fpass-plugin=$PLUGIN "$SRC" "$DRV" -o /tmp/ob 2>/dev/null \
+run_arch() { # triple runner-cmd linker-flag
+  local t=$1 run=${2:-} lf=${3:-}
+  $CLANG -O2 --target=$t -ffreestanding -nostdlib -static $lf "$SRC" "$DRV" -o /tmp/b 2>/dev/null \
+    || { printf "  %-24s object+IR only (no usable linker for this target here)\n" "$t"; return; }
+  RUSTCLOAK_VM=1 $CLANG -O2 --target=$t -ffreestanding -nostdlib -static $lf -fpass-plugin=$PLUGIN "$SRC" "$DRV" -o /tmp/ob 2>/dev/null \
     || { printf "  %-24s obf build fail\n" "$t"; return; }
   $run /tmp/b;  local B=$?
   $run /tmp/ob; local O=$?
   printf "  %-24s baseline_exit=%s obf_exit=%s match=%s\n" "$t" "$B" "$O" "$([ "$B" = "$O" ] && echo YES || echo NO)"
 }
-run_arch aarch64-linux-gnu                 # native
-run_arch x86_64-linux-gnu  qemu-x86_64     # x86-64 via qemu-user
+run_arch aarch64-linux-gnu                 # native: default ld
+# x86-64 behaviour needs a cross linker (lld); the object+IR check above covers it otherwise
+if command -v ld.lld >/dev/null 2>&1; then
+  run_arch x86_64-linux-gnu qemu-x86_64 "-fuse-ld=lld"
+else
+  printf "  %-24s object+IR only (install lld to run it here via qemu-user)\n" "x86_64-linux-gnu"
+fi
