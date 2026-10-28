@@ -227,7 +227,7 @@ void expandConstantUsers(GlobalVariable *G) {
 // once-guard -- noted for a future revision.)
 bool makeLazy(Module &M, Function *Helper, const EncTarget &T, const AntiEmu *ae, bool callsite) {
   LLVMContext &Ctx = M.getContext();
-  Type *I1 = Type::getInt1Ty(Ctx), *I64 = Type::getInt64Ty(Ctx);
+  Type *I64 = Type::getInt64Ty(Ctx);
   Type *Ptr = PointerType::getUnqual(Ctx);
   GlobalVariable *G = T.G;
 
@@ -250,19 +250,37 @@ bool makeLazy(Module &M, Function *Helper, const EncTarget &T, const AntiEmu *ae
     dec->setUnnamedAddr(GlobalValue::UnnamedAddr::None);
   }
 
-  auto *Flag = new GlobalVariable(M, I1, /*isConstant=*/false, GlobalValue::InternalLinkage,
-                                  ConstantInt::getFalse(Ctx), rustcloak::anon("f"));
+  // Thread-safe exactly-once guard: the XOR keystream is self-inverse, so decrypting twice would
+  // re-encrypt. A 3-state atomic flag (0=init, 1=decrypting, 2=done) lets exactly one thread
+  // decrypt while any concurrent first-touchers spin until it publishes `done`.
+  Type *I32g = Type::getInt32Ty(Ctx);
+  auto *Flag = new GlobalVariable(M, I32g, /*isConstant=*/false, GlobalValue::InternalLinkage,
+                                  ConstantInt::get(I32g, 0), rustcloak::anon("f"));
   Function *Get = Function::Create(FunctionType::get(Ptr, false),
                                    GlobalValue::InternalLinkage, rustcloak::anon("g"), M);
   BasicBlock *entry = BasicBlock::Create(Ctx, "", Get);
+  BasicBlock *tryb = BasicBlock::Create(Ctx, "", Get);
   BasicBlock *decbb = BasicBlock::Create(Ctx, "", Get);
+  BasicBlock *spin = BasicBlock::Create(Ctx, "", Get);
   BasicBlock *done = BasicBlock::Create(Ctx, "", Get);
   IRBuilder<> B(entry);
-  B.CreateCondBr(B.CreateLoad(I1, Flag), done, decbb);
+  LoadInst *s0 = B.CreateLoad(I32g, Flag);
+  s0->setAtomic(AtomicOrdering::Acquire); s0->setAlignment(Align(4));
+  B.CreateCondBr(B.CreateICmpEQ(s0, ConstantInt::get(I32g, 2)), done, tryb);
+  B.SetInsertPoint(tryb);
+  AtomicCmpXchgInst *cx = B.CreateAtomicCmpXchg(
+      Flag, ConstantInt::get(I32g, 0), ConstantInt::get(I32g, 1), MaybeAlign(4),
+      AtomicOrdering::AcquireRelease, AtomicOrdering::Acquire);
+  B.CreateCondBr(B.CreateExtractValue(cx, 1), decbb, spin);
   B.SetInsertPoint(decbb);
   B.CreateCall(Helper, {dec, ConstantInt::get(I64, T.len), seedValue(B, Ctx, T.seed, ae)});
-  B.CreateStore(ConstantInt::getTrue(Ctx), Flag);
+  StoreInst *stf = B.CreateStore(ConstantInt::get(I32g, 2), Flag);
+  stf->setAtomic(AtomicOrdering::Release); stf->setAlignment(Align(4));
   B.CreateBr(done);
+  B.SetInsertPoint(spin);
+  LoadInst *s1 = B.CreateLoad(I32g, Flag);
+  s1->setAtomic(AtomicOrdering::Acquire); s1->setAlignment(Align(4));
+  B.CreateCondBr(B.CreateICmpEQ(s1, ConstantInt::get(I32g, 2)), done, spin);
   B.SetInsertPoint(done);
   B.CreateRet(dec);
 
