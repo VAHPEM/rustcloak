@@ -39,6 +39,15 @@ prog_check demo        "$CLANG"   test/demo.c                 ""
 prog_check vm_demo     "$CLANG"   test/vm_demo.c              "|stress"
 prog_check c_loops     "$CLANG"   test/corpus/c_loops.c       ""
 prog_check cpp_classes "$CLANGXX" test/corpus/cpp_classes.cpp ""
+prog_check strdata     "$CLANG"   test/corpus/strdata.c       ""
+
+# strenc must have encrypted the wide (i16) + table (i32) + i8 arrays in strdata; the plaintext
+# marker must not survive in the obfuscated binary (/tmp/dt_obf is strdata's, built last above).
+if strings /tmp/dt_obf 2>/dev/null | grep -q "strdata::secret::marker"; then
+  echo "  FAIL strenc: plaintext marker leaked in obfuscated binary"; fails=$((fails+1))
+else
+  echo "  OK   strenc leak: no plaintext marker in obfuscated binary"
+fi
 
 echo "== virt differential fuzz (short) =="
 SECS=${SECS:-30} PLUGIN="$(pwd)/$PLUGIN" bash test/fuzz/difffuzz_vm.sh 2>&1 | sed 's/^/  /'

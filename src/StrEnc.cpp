@@ -400,7 +400,14 @@ PreservedAnalyses StrEncPass::run(Module &M, ModuleAnalysisManager &) {
           CDA = dyn_cast<ConstantDataArray>(CS->getOperand(0));
           wrapTy = CS->getType();
         }
-    if (!CDA || !CDA->getElementType()->isIntegerTy(8))
+    // Widen beyond i8: wide strings and data/string tables are i16/i32 (and i64) arrays. The
+    // encryption is purely byte-wise (getRawDataValues + the i8* runtime helper), so any integer
+    // element width round-trips byte-for-byte regardless of endianness.
+    if (!CDA)
+      continue;
+    Type *elemTy = CDA->getElementType();
+    if (!(elemTy->isIntegerTy(8) || elemTy->isIntegerTy(16) ||
+          elemTy->isIntegerTy(32) || elemTy->isIntegerTy(64)))
       continue;
     // Referencing a global is always by pointer, so making it writable never breaks
     // another constant; the string is still reached through the same pointer.
@@ -418,7 +425,11 @@ PreservedAnalyses StrEncPass::run(Module &M, ModuleAnalysisManager &) {
     std::vector<uint8_t> enc(data.begin(), data.end());
     std::vector<uint8_t> plainForChain = enc;   // capture plaintext before xor overwrites it
     xorKeystream(enc, seed, cipher);
-    Constant *encArr = ConstantDataArray::get(Ctx, enc);
+    // Rebuild the ciphertext preserving the original element type (an i16/i32 global stays i16/i32);
+    // getRaw takes the encrypted bytes verbatim, matching the byte-wise runtime decrypt.
+    Constant *encArr = ConstantDataArray::getRaw(
+        StringRef(reinterpret_cast<const char *>(enc.data()), enc.size()),
+        CDA->getNumElements(), elemTy);
     G.setInitializer(wrapTy ? ConstantStruct::get(wrapTy, {encArr})
                             : encArr);
     G.setConstant(false);
