@@ -128,5 +128,13 @@ struct PartialOutlinePass : llvm::PassInfoMixin<PartialOutlinePass> {
   llvm::PreservedAnalyses run(llvm::Function &F, llvm::FunctionAnalysisManager &);
   static bool isRequired() { return true; }
 };
+struct LicensePass : llvm::PassInfoMixin<LicensePass> {
+  llvm::PreservedAnalyses run(llvm::Module &M, llvm::ModuleAnalysisManager &);
+  static bool isRequired() { return true; }
+};
+struct ImportHidePass : llvm::PassInfoMixin<ImportHidePass> {
+  llvm::PreservedAnalyses run(llvm::Module &M, llvm::ModuleAnalysisManager &);
+  static bool isRequired() { return true; }
+};
 
 #endif // RUSTCLOAK_H

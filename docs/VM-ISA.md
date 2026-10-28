@@ -14,7 +14,13 @@ seed-randomized — two functions share no instruction set.
   before code is emitted.
 - **Argument buffer** + **callee table**: staged call arguments and the function-pointer table the
   `CALL` opcode indexes (direct, non-vararg, ≤6 integer/pointer args).
-- **pc**: a byte offset into the bytecode (a PHI in the dispatch loop).
+- **pc**: a byte offset into the bytecode (a PHI in the fetch block).
+
+## Dispatch
+Direct-threaded: the fetch block reads the opcode byte, indexes a per-function table of handler
+**block addresses** (`blockaddress`), and ends in an `indirectbr` -- there is no central `switch`.
+The table is a non-constant global read through a volatile load, so the optimizer cannot fold it back
+into a switch, and a decompiler cannot recover the handler targets as readily as a switch jump table.
 
 ## Instruction encoding (4 bytes)
 ```
@@ -47,12 +53,25 @@ byte3 = b        ^ kb      (branch/jump target high byte, or pool index high)
 | `SEXT dst,a` (W) | sign-extend `reg[a]` from W bits to 64 |
 | `PUSHARG a` | stage `reg[a]` as the next call argument |
 | `CALL dst,idx` (W) | `reg[dst] = calleetable[idx](args...)`, re-zero-extended from width W |
+| `FADD FSUB FMUL FDIV` (W) | scalar float op; lane bits -> fW (W: 2=f32, 3=f64), op, bits back |
+| `FNEG` (W) | `reg[dst] = -reg[a]` as fW |
+| `FEQ FLT FLE FGT FGE FNE` (W) | ordered float compare -> `reg[dst]` (0/1) |
+| `SITOFP` / `FPTOSI` | int<->float convert; width bits encode (int i32/i64, float f32/f64) |
+| `FPEXT` / `FPTRUNC` | f32->f64 / f64->f32 |
 
 ## Eligibility (what stays native — correctness over coverage)
-Left as native code: variable-argument functions; float/vector values; indirect calls; calls with
->6 args or non-standard return width; exception handling (`invoke`/landingpad); integer widths
-outside {8,16,32,64} for width-sensitive ops; bytecode larger than 64 KiB (two-byte jump offsets).
-`eligible()` rejects the whole function on any of these, so the VM never mis-models an operation.
+Scalar `f32`/`f64` arithmetic, ordered comparison, neg, and i32/i64<->f32/f64 conversions ARE
+virtualized (the lane holds the raw bits; the handler bitcasts, runs the native LLVM float op, and
+bitcasts back, so results are bit-identical). Float loads/stores reuse the integer LOAD/STORE of the
+same width. Left as native code: variable-argument functions; vector values and non-i32/i64 float
+conversions; unordered/`uno`/`ord` float compares; indirect calls; calls with float args, >6 args or
+a non-standard return width; exception handling (`invoke`/landingpad); integer widths outside
+{8,16,32,64} for width-sensitive ops; bytecode larger than 64 KiB. `eligible()` rejects the whole
+function on any of these, so the VM never mis-models an operation.
+
+**Partial virtualization** (`RUSTCLOAK_VM_PARTIAL`): when a function is not wholly eligible, a clean
+single-successor block region is outlined (LLVM `CodeExtractor`) into its own function, which is then
+virtualized -- so part of an otherwise-native function still runs under the VM.
 
 ## Lowering notes
 - `select` -> `MOV dst,false; CMOVNZ dst,cond,true`.

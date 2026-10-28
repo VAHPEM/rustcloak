@@ -49,6 +49,8 @@ llvm::PassPluginLibraryInfo getRustCloakPluginInfo() {
                    ArrayRef<PassBuilder::PipelineElement>) {
                   if (Name == "strenc") { MPM.addPass(StrEncPass()); return true; }
                   if (Name == "antitamper") { MPM.addPass(AntiTamperPass()); return true; }
+                  if (Name == "license") { MPM.addPass(LicensePass()); return true; }
+                  if (Name == "imphide") { MPM.addPass(ImportHidePass()); return true; }
                   return false;
                 });
             // Automatic: loading the plugin into a default -O pipeline
@@ -71,6 +73,10 @@ llvm::PassPluginLibraryInfo getRustCloakPluginInfo() {
                   // anti-tamper LAST: section + rc_k-keyed constants over the final code, so it does
                   // not shrink virt eligibility (RUSTCLOAK_ANTITAMPER; needs the post-link patcher).
                   MPM.addPass(AntiTamperPass());
+                  // license key gate and import hiding (RUSTCLOAK_LICENSE / RUSTCLOAK_HIDE_IMPORTS;
+                  // no-ops unless their env var is set).
+                  MPM.addPass(LicensePass());
+                  MPM.addPass(ImportHidePass());
                 });
           }};
 }

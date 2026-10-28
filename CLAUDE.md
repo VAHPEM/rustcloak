@@ -1,8 +1,9 @@
 # CLAUDE.md — RustCloak
 
 LLVM new-pass-manager plugin that hardens programs against reverse engineering at the LLVM-IR
-level. Five transforms in `src/` — `flatten`, `strenc`, `subst`, `bogus`, `virt` — plus
-`Plugin.cpp` (registration) and `RustCloak.h` (seeded `anon()` names, per-build `rng`). It is the
+level. Transforms in `src/`: function passes `flatten`, `subst`, `bogus`, `virt`, `constenc`,
+`partial` (outline); module passes `strenc`, `antitamper`, `license`, `imphide`; plus `Plugin.cpp`
+(registration) and `RustCloak.h` (seeded `anon()` names, per-build `rng`). It is the
 red/blue counterpart to **rust-deobf** and a test-case generator for it, so **behaviour must be
 preserved exactly**.
 
@@ -20,6 +21,15 @@ cmake --build build          # -> build/libRustCloak.so
 
 Native target is **aarch64 ELF**. State which arch you actually ran — don't assume another
 (x86-64/PE/Mach-O need qemu-user or cross builds; see `test/matrix.sh`).
+
+If the Kali image has clang-21/libstdc++-16 installed alongside clang-18, `clang++-18` picks the
+newer libstdc++ headers and fails on C++; pin it with
+`CLANGXX="clang++-18 --gcc-install-dir=/usr/lib/gcc/aarch64-linux-gnu/14"` for the C++ corpus.
+
+`rustc -Zllvm-plugins=<plugin>` does NOT load this plugin: rustc's driver exports only ~375 LLVM
+symbols (0 IRBuilder), the plugin needs ~140 it does not export, and that set shifts every release —
+not fixable from the plugin side and high-maintenance if hacked. Obfuscate emitted IR with `opt`
+instead (`test/rust_e2e.sh`): same LLVM major, independent of rustc's exports, low maintenance.
 
 ## Correctness gate — the differential tests MUST pass after any pass change
 ```
@@ -46,10 +56,20 @@ A fixed `RUSTCLOAK_SEED` makes a build reproducible. "Measure before you conclud
 | `RUSTCLOAK_STRENC_CIPHER=1` | per-string LCG keystream instead of linear `seed+i` |
 | `RUSTCLOAK_STRENC_CALLSITE=1` | decrypt into a sibling buffer; the global stays ciphertext |
 | `RUSTCLOAK_ANTIEMU=1` | key decryption on a ctor-set marker (defeats isolated emulation) |
+| `RUSTCLOAK_STRENC_CHAIN=1` | chain per-string keys via FNV of the previous plaintext (ordered decrypt) |
+| `RUSTCLOAK_CONSTENC=1` | hide integer literals as `C ^ opaqueZero(arg)` |
+| `RUSTCLOAK_MBA_PERM=1` | wrap integer results in an invertible xor-shift permutation (GF(2) MBA) |
+| `RUSTCLOAK_VM_PARTIAL=1` | outline an eligible block region of an ineligible function and virtualize it |
+| `RUSTCLOAK_ANTITAMPER=1` | .text-section self-integrity; **requires** `tools/antitamper_patch.py <bin>` post-link |
+| `RUSTCLOAK_LICENSE=<hex>` | license gate: binary runs correctly only with matching `RC_KEY` env at runtime |
+| `RUSTCLOAK_HIDE_IMPORTS=a,b` | resolve named imports via `dlsym` (encrypted name); removes them from the import table (link `-ldl`) |
 
 ## virt invariants (the fragile pass — see the `binary-analysis` / `vuln-research` skills)
-- Registers are a uniform i64 lane kept zero-extended; width-sensitive opcodes carry a 2-bit width
-  code `{8,16,32,64}`. Any other integer width is left native by `eligible()`.
+- Registers are a uniform i64 lane; integers kept zero-extended, scalar f32/f64 kept as raw bits.
+  Width-sensitive opcodes carry a 2-bit width code `{8,16,32,64}` (for float ops 2=f32, 3=f64). Any
+  other integer width is left native by `eligible()`. Dispatch is an `indirectbr` through a handler-
+  address table (not a switch). `strenc` encrypts private constant arrays of i8/i16/i32/i64, not
+  only i8 strings.
 - Every constant the interpreter reads (literals, `trunc` masks, folded GEP offsets) must enter the
   pool **before** the `OP_CONST` batch is emitted — the constant-pool bug class lived here.
 - After editing, re-read for boundary / width / arch assumptions, *then* run `difftest.sh`.
