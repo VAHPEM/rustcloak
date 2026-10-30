@@ -55,6 +55,7 @@ jobs:
         run: |
           SECS=60 TARGET=vm_target2.c bash test/fuzz/difffuzz_vm.sh
           SECS=60 TARGET=vm_target3.c bash test/fuzz/difffuzz_vm.sh
+          SECS=60 TARGET=vm_target4.c bash test/fuzz/difffuzz_vm.sh
 
       - name: VM bytecode integrity (every byte-flip caught)
         run: bash test/tamper.sh

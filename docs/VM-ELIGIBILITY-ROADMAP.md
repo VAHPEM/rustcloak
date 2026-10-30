@@ -29,7 +29,20 @@ lane-typed/void return.
   path on those targets, confirm CI green and run a longer soak** (`SECS=7200 TARGET=vm_target3.c
   bash test/fuzz/difffuzz_vm.sh`) and `test/matrix.sh` on an x86_64 host.
 
-## Remaining — hole #4: indirect calls
-The callee is a runtime value with no type at the call site. Needs an `OP_CALLV` that calls a
-`reg`-held pointer through a `FunctionType` recovered/encoded from the call site. Highest risk; do
-last, same discipline (typed differential corpus + soak + matrix).
+## Done — indirect calls (hole #4)
+`OP_CALLV` holds the callee pointer in a register and the call site's `FunctionType` in a per-build
+signature table; the interpreter switches on the signature index and makes a real typed indirect
+call. `virtIndirectCall` accepts a non-vararg indirect call with <=8 lane-typed args and a
+lane-typed/void return; a `ConstantExpr` callee stays native. Corpus `test/fuzz/vm_target4.c` drives
+int(int,int) and float(float) indirect calls through virtualized trampolines.
+
+Both the direct and indirect call switches store each arm's result straight into `reg[dst]` and
+branch to a plain tail (no merge PHI), so nested re-virtualization -- which lowers every switch to a
+branch chain -- has no cross-block PHI edge to invalidate.
+
+Verification: AArch64 PASS -- difftest 6/6, combos 20/20 (incl. nested VM), 13.2M-iteration
+differential fuzz on vm_target4, zero divergence. x86-64/Win64 via CI as for the direct path.
+
+## Nothing left open
+All of eligible()'s call holes are closed. Any further work is on non-call ops (none currently
+rejected that matter in practice) -- revisit only if a real target shows a recurring native island.

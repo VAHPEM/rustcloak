@@ -88,6 +88,7 @@ enum Op : uint8_t {
   // conversions: SITOFP/FPTOSI encode (int i32/i64, float f32/f64) in the two width bits
   // (bit1=int width 0:i32/1:i64, bit0=float width 0:f32/1:f64); FPEXT is f32->f64, FPTRUNC f64->f32.
   OP_SITOFP = 51, OP_FPTOSI = 52, OP_FPEXT = 53, OP_FPTRUNC = 54,
+  OP_CALLV = 55,  // reg[dst] = (*(fn*)reg[a])(argbuf...) via signature table[b]  (indirect call)
 };
 
 static uint8_t wcodeOf(unsigned bits) {
@@ -172,6 +173,26 @@ static Function *virtCallee(CallInst *ci) {
   if (rt->isVoidTy() || isLaneTy(rt))
     return callee;
   return nullptr;
+}
+
+// An INDIRECT call we can virtualize: the callee is a runtime pointer value (no known Function),
+// non-vararg, with <=8 lane-typed args and a lane-typed/void return. OP_CALLV holds the pointer in a
+// register and the call site's FunctionType in a per-build signature table, so the interpreter makes
+// a real typed indirect call (ABI-correct by construction). A ConstantExpr callee (e.g. a bitcast of
+// a Function) is NOT okOperand, so such a call stays native.
+static bool virtIndirectCall(CallInst *ci) {
+  if (ci->isInlineAsm() || ci->getCalledFunction())
+    return false;
+  FunctionType *ft = ci->getFunctionType();
+  if (ft->isVarArg() || ci->arg_size() > 8)
+    return false;
+  if (!ci->getCalledOperand()->getType()->isPointerTy())
+    return false;
+  for (Value *a : ci->args())
+    if (!isLaneTy(a->getType()))
+      return false;
+  Type *rt = ci->getType();
+  return rt->isVoidTy() || isLaneTy(rt);
 }
 
 // ---- selective virtualization --------------------------------------------------------------
@@ -361,7 +382,7 @@ static bool eligible(Function &F, bool nested = false) {
       } else if (isa<PHINode>(&I)) {
         ok = isLaneTy(I.getType());
       } else if (auto *ci = dyn_cast<CallInst>(&I)) {
-        ok = virtCallee(ci) != nullptr;
+        ok = virtCallee(ci) != nullptr || virtIndirectCall(ci);
       } else if (auto *al = dyn_cast<AllocaInst>(&I)) {
         ok = nested && al->isStaticAlloca();   // fixed-size stack slot, nested layer only
       } else if (isa<ReturnInst>(&I) || isa<BranchInst>(&I)) {
@@ -373,8 +394,9 @@ static bool eligible(Function &F, bool nested = false) {
       for (Value *op : I.operands()) {
         if (isa<BasicBlock>(op))
           continue;
-        if (callI && op == callI->getCalledOperand())
-          continue;                      // the callee (a Function) is handled via the callee table
+        if (callI && op == callI->getCalledOperand() && isa<Function>(op))
+          continue;                      // direct callee Function: via the typed CALL switch, no reg
+        // (an indirect callee is a runtime pointer value -> falls through, must be a lane operand)
         if (!okOperand(op, nested))
           return false;                  // globals / constexprs / float consts -> native
       }
@@ -486,7 +508,7 @@ static bool virtualizeOnce(Function &F, unsigned layer) {
   // share no instruction set.
   std::mt19937_64 encRng =
       rustcloak::rng(("vmenc:" + std::to_string(layer) + ":" + F.getName()).str());
-  const unsigned NBASE = OP_FPTRUNC + 1;  // all integer, nested, and float opcodes
+  const unsigned NBASE = OP_CALLV + 1;    // all integer, nested, float, and indirect-call opcodes
   auto weightOf = [](unsigned b) -> unsigned {
     switch (b) {
     case OP_MOV: case OP_CONST: case OP_ADD: case OP_SUB:
@@ -661,15 +683,25 @@ static bool virtualizeOnce(Function &F, unsigned layer) {
   // the callees reached by CALL opcodes, as a per-function function-pointer table
   std::vector<Function *> callees;
   DenseMap<Function *, unsigned> calleeIdx;
+  std::vector<FunctionType *> callSigs;          // distinct FunctionTypes of virtualizable indirect calls
+  DenseMap<FunctionType *, unsigned> sigIdx;
   for (BasicBlock &BB : F)
     for (Instruction &I : BB)
-      if (auto *ci = dyn_cast<CallInst>(&I))
-        if (Function *c = virtCallee(ci))
+      if (auto *ci = dyn_cast<CallInst>(&I)) {
+        if (Function *c = virtCallee(ci)) {
           if (!calleeIdx.count(c)) {
             calleeIdx[c] = (unsigned)callees.size();
             callees.push_back(c);
           }
-  if (P.nreg > 256 || P.consts.size() > 0xffff || callees.size() > 256)
+        } else if (virtIndirectCall(ci)) {
+          FunctionType *ft = ci->getFunctionType();
+          if (!sigIdx.count(ft)) {
+            sigIdx[ft] = (unsigned)callSigs.size();
+            callSigs.push_back(ft);
+          }
+        }
+      }
+  if (P.nreg > 256 || P.consts.size() > 0xffff || callees.size() > 256 || callSigs.size() > 256)
     return false;
 
   auto regOf = [&](Value *v) -> unsigned {
@@ -831,7 +863,10 @@ static bool virtualizeOnce(Function &F, unsigned layer) {
           unsigned rw = ci->getType()->getIntegerBitWidth();
           if (rw == 8 || rw == 16 || rw == 32) callw = rw;
         }
-        emit(OP_CALL, callw, rd, calleeIdx[ci->getCalledFunction()], 0);
+        if (Function *cf = ci->getCalledFunction())
+          emit(OP_CALL, callw, rd, calleeIdx[cf], 0);
+        else                                   // indirect: fn pointer reg in a, signature index in b
+          emit(OP_CALLV, 0, rd, regOf(ci->getCalledOperand()), sigIdx[ci->getFunctionType()]);
       } else if (auto *al = dyn_cast<AllocaInst>(&I)) {   // nested layer only
         unsigned ci = P.cpoolIdx[al->getAllocationSize(DL)->getFixedValue()];
         emit(OP_ALLOCA, 64, d, ci & 0xff, ci >> 8);
@@ -1097,13 +1132,14 @@ static bool virtualizeOnce(Function &F, unsigned layer) {
     if (base == OP_CALL && !callees.empty()) {
       // Per-callee TYPED dispatch: switch on the callee index, emit a real typed call for each,
       // reconstruct args from the staged lane bits (ptr<-int, float<-low 32 bits, double<-bits) and
-      // fold the result back into the i64 lane. A normal typed call lets the backend place
-      // integer/pointer/float args and the return value in the right ABI slots -- correct for float
-      // args, >6 args and float/odd-width returns, which the old uniform i64(i64x6) thunk could not.
+      // write the result straight into reg[dst]. A normal typed call lets the backend place
+      // integer/pointer/float args and the return in the right ABI slots -- correct for float args,
+      // >6 args and float/odd-width returns, which the old uniform i64(i64x6) thunk could not. Each
+      // arm stores reg[dst] then branches to a plain tail (no merge PHI -- so nested re-virt, which
+      // lowers every switch to branches, has no cross-block PHI edge to invalidate).
       Type *i32t = Type::getInt32Ty(Ctx);
       BasicBlock *merge = BasicBlock::Create(Ctx, "", &F, bad);
       SwitchInst *csw = B.CreateSwitch(ra, merge, callees.size());
-      std::vector<std::pair<Value *, BasicBlock *>> inc;
       for (unsigned ci2 = 0; ci2 < callees.size(); ci2++) {
         Function *cal = callees[ci2];
         FunctionType *FT = cal->getFunctionType();
@@ -1124,7 +1160,7 @@ static bool virtualizeOnce(Function &F, unsigned layer) {
           else if (pt->isIntegerTy())
             av = pt->getIntegerBitWidth() == 64 ? raw : (Value *)B.CreateTrunc(raw, pt);
           else
-            av = raw;                       // unreachable: eligibility guarantees lane-typed args
+            av = raw;
           ca.push_back(av);
         }
         Value *r = B.CreateCall(FT, cal, ca);
@@ -1142,15 +1178,63 @@ static bool virtualizeOnce(Function &F, unsigned layer) {
           lane = rt->getIntegerBitWidth() == 64 ? r : (Value *)B.CreateZExt(r, i64);
         else
           lane = B.getInt64(0);
-        inc.push_back({lane, B.GetInsertBlock()});
+        storeReg(dst, lane);
         B.CreateBr(merge);
       }
       B.SetInsertPoint(merge);
-      PHINode *phi = B.CreatePHI(i64, inc.size() + 1);
-      for (auto &pr : inc)
-        phi->addIncoming(pr.first, pr.second);
-      phi->addIncoming(B.getInt64(0), h);   // switch default (unreached: ra is always a valid index)
-      storeReg(dst, phi);
+      B.CreateStore(B.getInt64(0), argn);
+      finish(pc4);
+      continue;
+    }
+    if (base == OP_CALLV && !callSigs.empty()) {
+      // Indirect typed dispatch: the fn pointer is in reg[a]; switch on the signature index in
+      // operand b, call through that FunctionType, store the result into reg[dst]. Same
+      // storeReg-per-arm shape (no merge PHI) so nested re-virt switch-lowering stays valid.
+      Type *i32t = Type::getInt32Ty(Ctx);
+      Value *fpv = B.CreateIntToPtr(loadReg(ra), ptrTy);
+      BasicBlock *merge = BasicBlock::Create(Ctx, "", &F, bad);
+      SwitchInst *vsw = B.CreateSwitch(rb, merge, callSigs.size());
+      for (unsigned si = 0; si < callSigs.size(); si++) {
+        FunctionType *FT = callSigs[si];
+        BasicBlock *arm = BasicBlock::Create(Ctx, "", &F, merge);
+        vsw->addCase(ConstantInt::get(cast<IntegerType>(i64), si), arm);
+        B.SetInsertPoint(arm);
+        SmallVector<Value *, 8> ca;
+        for (unsigned ai = 0; ai < FT->getNumParams(); ai++) {
+          Type *pt = FT->getParamType(ai);
+          Value *raw = B.CreateLoad(i64, B.CreateGEP(argbufTy, argbuf, {B.getInt64(0), B.getInt64(ai)}));
+          Value *av;
+          if (pt->isPointerTy())
+            av = B.CreateIntToPtr(raw, pt);
+          else if (pt->isDoubleTy())
+            av = B.CreateBitCast(raw, pt);
+          else if (pt->isFloatTy())
+            av = B.CreateBitCast(B.CreateTrunc(raw, i32t), pt);
+          else if (pt->isIntegerTy())
+            av = pt->getIntegerBitWidth() == 64 ? raw : (Value *)B.CreateTrunc(raw, pt);
+          else
+            av = raw;
+          ca.push_back(av);
+        }
+        Value *r = B.CreateCall(FT, fpv, ca);
+        Type *rt = FT->getReturnType();
+        Value *lane;
+        if (rt->isVoidTy())
+          lane = B.getInt64(0);
+        else if (rt->isPointerTy())
+          lane = B.CreatePtrToInt(r, i64);
+        else if (rt->isDoubleTy())
+          lane = B.CreateBitCast(r, i64);
+        else if (rt->isFloatTy())
+          lane = B.CreateZExt(B.CreateBitCast(r, i32t), i64);
+        else if (rt->isIntegerTy())
+          lane = rt->getIntegerBitWidth() == 64 ? r : (Value *)B.CreateZExt(r, i64);
+        else
+          lane = B.getInt64(0);
+        storeReg(dst, lane);
+        B.CreateBr(merge);
+      }
+      B.SetInsertPoint(merge);
       B.CreateStore(B.getInt64(0), argn);
       finish(pc4);
       continue;
