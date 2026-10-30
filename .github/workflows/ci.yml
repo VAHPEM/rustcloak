@@ -1,0 +1,83 @@
+name: ci
+
+# Build RustCloak and run the differential CORRECTNESS gate on every push/PR. "Behaviour preserved
+# exactly" is the product promise, so the gate is what protects it: a bad merge that silently
+# miscompiles must fail here, not in a user's build.
+#
+# The LLVM 18 job is required. 19/20 are best-effort early-warning for the next LLVM major (a red
+# 19/20 means the plugin needs porting -- deprecated/removed LLVM C++ APIs -- before Rust bundles
+# that LLVM).
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  build-test:
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        llvm: ["18"]
+        include:
+          - { llvm: "19", optional: true }
+          - { llvm: "20", optional: true }
+    continue-on-error: ${{ matrix.optional == true }}
+    name: llvm-${{ matrix.llvm }}
+    env:
+      CLANG: clang-${{ matrix.llvm }}
+      CLANGXX: clang++-${{ matrix.llvm }}
+      OPT: opt-${{ matrix.llvm }}
+      LLVM_CONFIG: llvm-config-${{ matrix.llvm }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install LLVM ${{ matrix.llvm }} + build tools
+        run: |
+          wget -qO /tmp/llvm.sh https://apt.llvm.org/llvm.sh
+          chmod +x /tmp/llvm.sh
+          sudo /tmp/llvm.sh ${{ matrix.llvm }}
+          sudo apt-get install -y llvm-${{ matrix.llvm }}-dev clang-${{ matrix.llvm }} \
+                                  cmake ninja-build
+
+      - name: Build plugin
+        run: |
+          cmake -S . -B build -G Ninja -DLLVM_DIR="$(llvm-config-${{ matrix.llvm }} --cmakedir)"
+          cmake --build build
+
+      # --- correctness gate (required) ---
+      - name: Differential correctness (baseline == obfuscated, + virt fuzz)
+        run: bash test/difftest.sh
+
+      - name: Every flag COMBINATION stays behaviour-correct
+        run: bash test/combos.sh
+
+      - name: VM bytecode integrity (every byte-flip caught)
+        run: bash test/tamper.sh
+
+      - name: Metamorphism invariant (same seed reproduces, different seeds diverge)
+        run: bash test/diversity.sh
+
+      # --- cross-arch / cross-format behavioural matrix (ELF x64/ARM64 + PE via wine) ---
+      # Emulators/toolchains that are absent are reported SKIP by the script, never a silent pass.
+      - name: Install cross targets (qemu-user, wine, mingw)
+        continue-on-error: true
+        run: |
+          sudo dpkg --add-architecture i386 || true
+          sudo apt-get update
+          sudo apt-get install -y qemu-user-static gcc-aarch64-linux-gnu \
+                                  gcc-mingw-w64-x86-64 wine wine64 lld || true
+      - name: Arch/format matrix
+        continue-on-error: true
+        run: bash test/matrix.sh
+
+      # --- Rust path: passes run on real rustc IR, IR verifies, no plaintext leak ---
+      - name: Install Rust nightly (matching LLVM 18)
+        if: matrix.llvm == '18'
+        continue-on-error: true
+        run: |
+          rustup toolchain install nightly-2024-06-15 --profile minimal || true
+      - name: Rust end-to-end (opt-on-IR)
+        if: matrix.llvm == '18'
+        continue-on-error: true
+        run: NIGHTLY=nightly-2024-06-15 bash test/rust_e2e.sh
