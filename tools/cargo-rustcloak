@@ -1,0 +1,95 @@
+#!/usr/bin/env bash
+# cargo-rustcloak -- harden a Rust crate with RustCloak in ONE command.
+#
+#   cargo rustcloak [build|rustc|test|run] [cargo args...]    # if on PATH as cargo-rustcloak
+#   tools/cargo-rustcloak build --release                     # or run directly from the repo
+#
+# It makes itself cargo's RUSTC_WRAPPER so cargo's own build graph drives everything, and hardens
+# the PRIMARY package's crates ONLY -- dependencies, build scripts and proc-macros pass through
+# untouched. rustc performs the final link either way, so the output runs normally.
+#
+# Two mechanisms, auto-selected (override with RUSTCLOAK_VIA=plugin|opt):
+#   plugin : inject -Zllvm-plugins=<plugin> into rustc (clean, but NIGHTLY-only and needs a rustc
+#            whose bundled LLVM exports the plugin's symbols -- most rustup toolchains do NOT).
+#   opt    : compile with -Csave-temps, then a linker shim (tools/rustcloak-swap-linker) runs the
+#            passes over each codegen unit's optimized bitcode via `opt` and substitutes the
+#            hardened object at link time. Works with ordinary rustup toolchains. Linux-focused.
+# The driver probes whether -Zllvm-plugins loads and picks `plugin` if so, else `opt`.
+#
+# Env knobs
+#   RUSTCLOAK_PLUGIN     path to libRustCloak.so            (default <repo>/build/libRustCloak.so)
+#   RUSTCLOAK_VIA        plugin | opt                       (default: auto-probe)
+#   RUSTCLOAK_CRATES     comma list of crate names to harden (default: whole primary package)
+#   RUSTCLOAK_TOOLCHAIN  rustc toolchain, e.g. nightly-2024-06-15 -> runs `cargo +<tc>`
+#   RUSTCLOAK_PASSES     opt -passes string for `opt` mode
+#                        (default: strenc,function(virt,constenc,subst,bogus,flatten))
+#   plus the usual build-time flags (RUSTCLOAK_VM=1, RUSTCLOAK_HARDEN=1, RUSTCLOAK_SUBST_DEPTH=N,
+#   RUSTCLOAK_SEED=...), inherited by the passes in both modes.
+set -uo pipefail
+
+# ============================================================ wrapper mode (cargo calls us)
+# argv:  $0 /path/to/rustc <rustc args...>
+if [ "${RUSTCLOAK_WRAP:-}" = "1" ]; then
+  real_rustc="${1:?rustc path}"; shift
+  cname=""; prev=""
+  for a in "$@"; do [ "$prev" = "--crate-name" ] && { cname="$a"; break; }; prev="$a"; done
+
+  harden=0
+  [ "${CARGO_PRIMARY_PACKAGE:-}" = "1" ] && harden=1              # primary package only
+  case " $* " in *" proc-macro "*|*"crate-type=proc-macro"*) harden=0 ;; esac
+  case "$cname" in build_script_build|build-script-build) harden=0 ;; esac
+  if [ "$harden" = 1 ] && [ -n "${RUSTCLOAK_CRATES:-}" ]; then
+    case ",${RUSTCLOAK_CRATES}," in *",${cname},"*) : ;; *) harden=0 ;; esac
+  fi
+
+  if [ "$harden" != 1 ]; then exec "$real_rustc" "$@"; fi
+
+  case "${RUSTCLOAK_VIA:-opt}" in
+    plugin)
+      exec "$real_rustc" "$@" -Zllvm-plugins="${RUSTCLOAK_PLUGIN:?}" ;;
+    opt)
+      # keep optimized per-CGU bitcode next to each object; swap in hardened objects at link.
+      exec "$real_rustc" "$@" -Csave-temps -Ccodegen-units=1 \
+           -Clinker="${RUSTCLOAK_SWAP_LINKER:?}" ;;
+    *) echo "cargo-rustcloak: unknown RUSTCLOAK_VIA=$RUSTCLOAK_VIA" >&2; exit 2 ;;
+  esac
+fi
+
+# ============================================================ driver mode (user runs it)
+HERE="$(cd "$(dirname "$0")" && pwd)"
+self="$HERE/$(basename "$0")"
+swap="$HERE/rustcloak-swap-linker"
+
+PLUGIN="${RUSTCLOAK_PLUGIN:-$HERE/../build/libRustCloak.so}"
+if [ ! -f "$PLUGIN" ]; then
+  echo "cargo-rustcloak: plugin not found: $PLUGIN" >&2
+  echo "  build it:  cmake -S . -B build -G Ninja -DLLVM_DIR=\$(llvm-config-18 --cmakedir) && cmake --build build" >&2
+  echo "  or set RUSTCLOAK_PLUGIN to an existing libRustCloak.so" >&2
+  exit 1
+fi
+PLUGIN="$(cd "$(dirname "$PLUGIN")" && pwd)/$(basename "$PLUGIN")"
+[ -x "$swap" ] || { echo "cargo-rustcloak: missing $swap" >&2; exit 1; }
+
+TC=(); [ -n "${RUSTCLOAK_TOOLCHAIN:-}" ] && TC=("+${RUSTCLOAK_TOOLCHAIN}")
+PASSES="${RUSTCLOAK_PASSES:-strenc,function(virt,constenc,subst,bogus,flatten)}"
+
+# --- choose mechanism ---
+VIA="${RUSTCLOAK_VIA:-}"
+if [ -z "$VIA" ]; then
+  tmp="$(mktemp -d)"; trap 'rm -rf "$tmp"' EXIT
+  printf 'fn main(){}\n' > "$tmp/probe.rs"
+  if rustc "${TC[@]}" -Zllvm-plugins="$PLUGIN" -o "$tmp/probe" "$tmp/probe.rs" >/dev/null 2>&1; then
+    VIA=plugin
+  else
+    VIA=opt
+  fi
+fi
+
+sub="${1:-build}"; [ $# -gt 0 ] && shift
+echo "cargo-rustcloak: hardening the primary package via '$VIA' (plugin: $PLUGIN${RUSTCLOAK_CRATES:+, crates: $RUSTCLOAK_CRATES})"
+[ "$VIA" = plugin ] || echo "  (opt mode: codegen-units forced to 1; passes: $PASSES)"
+
+export RUSTC_WRAPPER="$self" RUSTCLOAK_WRAP=1 RUSTCLOAK_VIA="$VIA"
+export RUSTCLOAK_PLUGIN="$PLUGIN" RUSTCLOAK_SWAP_LINKER="$swap"
+export RCPLUG="$PLUGIN" RCPASSES="$PASSES"      # read by the swap linker in opt mode
+exec cargo "${TC[@]}" "$sub" "$@"

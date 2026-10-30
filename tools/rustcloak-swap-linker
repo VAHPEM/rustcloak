@@ -1,0 +1,31 @@
+#!/usr/bin/env bash
+# Linker shim used by `cargo rustcloak` in opt-on-IR mode (RUSTCLOAK_VIA=opt), for rustc toolchains
+# that cannot load the plugin via -Zllvm-plugins (rustup hides the LLVM symbols the plugin needs).
+#
+# rustc compiles the crate with -Csave-temps, so next to every `*.rcgu.o` it emits sits the matching
+# OPTIMIZED bitcode `*.rcgu.bc`. We run the RustCloak passes (via opt + the plugin) over that
+# bitcode, compile the result to an object, substitute it for the original in the link line, and
+# then invoke the real C compiler/linker. rustc therefore performs the normal final link (std, panic
+# runtime, allocator), so the output binary/library runs normally -- only the crate's own code is
+# obfuscated.
+#
+# Env (set by the driver): RCPLUG=<libRustCloak.so>  RCPASSES=<opt -passes string>
+#                          RC_CC=<real linker driver, default cc>  OPT=<opt-18>  CLANG=<clang-18>
+set -u
+OPT="${OPT:-opt-18}"; CLANG="${CLANG:-clang-18}"; RC_CC="${RC_CC:-cc}"
+: "${RCPLUG:?rustcloak-swap-linker: RCPLUG unset}"
+: "${RCPASSES:?rustcloak-swap-linker: RCPASSES unset}"
+out=()
+for a in "$@"; do
+  if [[ "$a" == *.rcgu.o && -f "${a%.o}.bc" ]]; then
+    h="${a%.o}.rcloak"
+    if "$OPT" -load-pass-plugin="$RCPLUG" -passes="$RCPASSES" "${a%.o}.bc" -o "$h.bc" 2>>"${RC_SWAP_LOG:-/dev/null}" \
+       && "$CLANG" -c "$h.bc" -o "$h.o" 2>>"${RC_SWAP_LOG:-/dev/null}"; then
+      a="$h.o"
+    else
+      echo "rustcloak-swap-linker: WARNING: hardening failed for ${a}, linking it UNHARDENED" >&2
+    fi
+  fi
+  out+=("$a")
+done
+exec "$RC_CC" "${out[@]}"
