@@ -232,6 +232,8 @@ opt-18 -load-pass-plugin=build/libRustCloak.so -passes='strenc,function(subst,bo
 #   RUSTCLOAK_LAZY=1     decrypt each string on first use, not all at startup
 #   RUSTCLOAK_ANTIEMU=1  bind string keys to a loader-set marker (defeats isolated emulation)
 #   RUSTCLOAK_STRENC_SELFKEY=1  derive that marker by hashing the ciphertext (key is never a constant)
+#   RUSTCLOAK_STRENC_SYSCALLKEY=1  derive the key from time(NULL) at run time (Linux): correct
+#                        on a real host, garbage under syscall-stubbing emulation
 #   RUSTCLOAK_BOGUS_TWOWAY=1  two-way opaque predicates (both arms live, no prunable dead branch)
 #   RUSTCLOAK_VM=1       virtualize eligible functions into custom-bytecode + interpreter
 #   RUSTCLOAK_VM_SELECTIVE=1  virtualize only sensitive-named functions (not every eligible one)

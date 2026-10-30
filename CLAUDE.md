@@ -57,6 +57,7 @@ A fixed `RUSTCLOAK_SEED` makes a build reproducible. "Measure before you conclud
 | `RUSTCLOAK_STRENC_CALLSITE=1` | decrypt into a sibling buffer; the global stays ciphertext |
 | `RUSTCLOAK_ANTIEMU=1` | key decryption on a ctor-set marker (defeats isolated emulation) |
 | `RUSTCLOAK_STRENC_CHAIN=1` | chain per-string keys via FNV of the previous plaintext (ordered decrypt) |
+| `RUSTCLOAK_STRENC_SYSCALLKEY=1` | key decryption on a real syscall (time(NULL)); defeats constructor-replay emulation (Linux-first) |
 | `RUSTCLOAK_CONSTENC=1` | hide integer literals as `C ^ opaqueZero(arg)` |
 | `RUSTCLOAK_MBA_PERM=1` | wrap integer results in an invertible xor-shift permutation (GF(2) MBA) |
 | `RUSTCLOAK_VM_PARTIAL=1` | outline an eligible block region of an ineligible function and virtualize it |

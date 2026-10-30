@@ -175,6 +175,30 @@ void emitComputedMarkerCtor(Module &M, const AntiEmu &ae, GlobalVariable *anchor
   appendToGlobalCtors(M, C, 0);
 }
 
+// RUSTCLOAK_STRENC_SYSCALLKEY (Linux-first): derive the key marker from a real syscall instead of
+// a stored constant or a ciphertext hash. A constructor calls time(NULL); the marker equals `magic`
+// only when the result is nonzero. On any real host time() is never 0, so decryption is always
+// correct -- but an isolated emulator that stubs the time syscall to 0 (as a static deobfuscator
+// that runs constructors but not real syscalls does) gets a wrong marker and recovers garbage. This
+// answers "run the constructors, then emulate", which SELFKEY (a pure ciphertext hash) does not.
+void emitSyscallMarkerCtor(Module &M, const AntiEmu &ae, uint32_t poison) {
+  LLVMContext &Ctx = M.getContext();
+  Type *I32 = Type::getInt32Ty(Ctx), *I64 = Type::getInt64Ty(Ctx);
+  Type *Ptr = PointerType::getUnqual(Ctx);
+  // time_t time(time_t*) -- time_t is a 64-bit long on the supported LP64 targets.
+  FunctionCallee timeFn = M.getOrInsertFunction("time", FunctionType::get(I64, {Ptr}, false));
+  Function *C = Function::Create(FunctionType::get(Type::getVoidTy(Ctx), false),
+                                 GlobalValue::InternalLinkage, rustcloak::anon("mkc"), M);
+  IRBuilder<> B(BasicBlock::Create(Ctx, "entry", C));
+  Value *t = B.CreateCall(timeFn, {ConstantPointerNull::get(cast<PointerType>(Ptr))});
+  Value *nz = B.CreateICmpNE(t, ConstantInt::get(I64, 0));     // true on any real host
+  Value *mk = B.CreateSelect(nz, ConstantInt::get(I32, ae.magic),
+                                 ConstantInt::get(I32, ae.magic ^ poison));
+  B.CreateStore(mk, ae.marker)->setVolatile(true);
+  B.CreateRetVoid();
+  appendToGlobalCtors(M, C, 0);                                // before the decryptor (priority 1)
+}
+
 // Eager mode: one global constructor that decrypts all the given strings before main().
 void emitStartupCtor(Module &M, Function *Helper, ArrayRef<EncTarget> targets, const AntiEmu *ae) {
   LLVMContext &Ctx = M.getContext();
@@ -474,6 +498,13 @@ PreservedAnalyses StrEncPass::run(Module &M, ModuleAnalysisManager &) {
     ae_storage.marker = new GlobalVariable(M, I32, /*isConstant=*/false, GlobalValue::InternalLinkage,
                                            ConstantInt::get(I32, 0), rustcloak::anon("mkv"));
     emitComputedMarkerCtor(M, ae_storage, anchor, alen);
+    ae = &ae_storage;
+  } else if (std::getenv("RUSTCLOAK_STRENC_SYSCALLKEY") && !targets.empty()) {
+    // Syscall-gated marker: correct on any real host, garbage under time-stubbing emulation.
+    ae_storage.magic = (uint32_t)gen() | 1u;
+    ae_storage.marker = new GlobalVariable(M, I32, /*isConstant=*/false, GlobalValue::InternalLinkage,
+                                           ConstantInt::get(I32, 0), rustcloak::anon("mkv"));
+    emitSyscallMarkerCtor(M, ae_storage, (uint32_t)gen() | 1u);
     ae = &ae_storage;
   } else if (std::getenv("RUSTCLOAK_ANTIEMU")) {
     ae_storage.magic = (uint32_t)gen() | 1u;
