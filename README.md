@@ -340,16 +340,27 @@ to the second:
 
 ## Roadmap
 
-- More opaque-predicate families and junk-code generators; protect the decrypt constructor itself.
-- A `cargo` wrapper so a build is just `cargo rustcloak build`.
-- Anti-debug / anti-tamper checks. (Anti-emulation via loader-bound keys and MBA substitution are
-  now implemented — see `RUSTCLOAK_ANTIEMU` and transform 3.)
-- Stronger anti-analysis state no constructor sets: keys derived at the first real syscall, or
-  timing/TSC gates — the next step beyond what constructor-replay can answer.
-- **Code virtualization — multi-round build-out.** Round 1 (done, `RUSTCLOAK_VM=1`) virtualizes
-  single-block integer functions. Next rounds: branch opcodes (whole-CFG virtualization, loops),
-  load/store opcodes (memory), call opcodes; then multiple randomized VM dispatch shapes and a
-  bytecode whose encoding is itself per-build randomized/encrypted, so two builds share no VM.
+Already shipped since the first cut (see the build-time flags above and `docs/VM-ISA.md`): whole-CFG
+virtualization (branch opcodes, loops), memory load/store and call opcodes, scalar float (f32/f64)
+opcodes, partial block-level virtualization of otherwise-ineligible functions, per-build randomized
+synonym opcodes with XOR-encrypted operands, jump-table (`indirectbr`) dispatch, bytecode
+self-integrity, and nested VM-in-VM. Anti-emulation via loader-bound / self-derived string keys
+(`RUSTCLOAK_ANTIEMU`, `RUSTCLOAK_STRENC_SELFKEY`) and iterated MBA substitution are implemented.
+
+Next, in order of leverage:
+
+- **Adoption — `cargo rustcloak`.** One command hardens a crate (`tools/cargo-rustcloak`, `docs/CARGO.md`):
+  a `RUSTC_WRAPPER` that injects the plugin into the primary package's crates only, so rustc still
+  links and the output runs normally.
+- **Key provenance over new ciphers.** Derive string/const keys at the first real syscall, or from a
+  timing/TSC gate — the step beyond what constructor-replay can answer. Adding more cipher
+  *algorithms* buys nothing: the red/blue measurement shows emulation defeats every static cipher
+  equally, so what matters is a key the emulator cannot reproduce, not a stronger cipher.
+- **Close the VM eligibility holes.** Indirect calls, calls with >6 args or float args currently stay
+  native — and *what stays native is itself a signal to the analyst*.
+- **Per-build randomized/encrypted bytecode encoding**, so two builds share no VM ISA at all.
+- **More opaque-predicate families and junk-code generators; protect the decrypt constructor itself.**
+- **Coverage.** A behavioural (run) matrix for Mach-O, not only object-level (`test/matrix_macho.sh`).
 
 ## Layout
 

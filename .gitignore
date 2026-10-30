@@ -9,3 +9,4 @@ test/fuzz/*.so
 test/fuzz/base.o
 test/fuzz/vm_stdfuzz
 test/fuzz/vm_difffuzz
+.DS_Store
