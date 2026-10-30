@@ -147,10 +147,10 @@ static bool okOperand(Value *v, bool allowGlobal = false) {
          isa<UndefValue>(v) || isa<ConstantPointerNull>(v);
 }
 
-// A direct call we can virtualize: a known, non-vararg, non-intrinsic callee, at most 6 integer/
-// pointer arguments (all passed in registers on SysV/AAPCS, so a uniform i64(i64x6) thunk is ABI-
-// safe), returning an integer/pointer/void. Float/vector args or >6 args -> leave the function
-// native.
+// A direct call we can virtualize: a known, non-vararg, non-intrinsic DIRECT callee with up to 8
+// lane-typed args (int<=64 / pointer / float / double) and a lane-typed or void return. OP_CALL
+// dispatches through a per-callee TYPED call, so each arg/return lands in the right ABI slot by
+// construction. Indirect callees stay native (their type is unknown at the call site).
 // The VM's width-sensitive opcodes carry a 2-bit width code that decodes to {8,16,32,64}. An
 // integer of any other width would be decoded as 64-bit and mis-handled, so such ops are only
 // virtualized at these widths.
@@ -160,18 +160,16 @@ static Function *virtCallee(CallInst *ci) {
   if (ci->isInlineAsm())
     return nullptr;
   Function *callee = ci->getCalledFunction();
-  if (!callee || callee->isIntrinsic() || callee->isVarArg() || ci->arg_size() > 6)
+  // argbuf stages 8 args; OP_CALL emits a real typed call per callee (below), so the backend places
+  // integer/pointer/float args and the return in the correct ABI slots. Accept up to 8 lane-typed
+  // args and a lane-typed/void return; indirect (unknown-type) callees stay native.
+  if (!callee || callee->isIntrinsic() || callee->isVarArg() || ci->arg_size() > 8)
     return nullptr;
   for (Value *a : ci->args())
-    if (!isRegTy(a->getType()))
+    if (!isLaneTy(a->getType()))
       return nullptr;
   Type *rt = ci->getType();
-  // Returned through a uniform i64 thunk: void and pointer are fine as-is; a narrow int is re-zero-
-  // extended by the CALL handler from its (standard) width. A non-standard int return width has no
-  // width-code slot, so leave such a callee native.
-  if (rt->isVoidTy() || rt->isPointerTy())
-    return callee;
-  if (rt->isIntegerTy() && stdWidth(rt->getIntegerBitWidth()))
+  if (rt->isVoidTy() || isLaneTy(rt))
     return callee;
   return nullptr;
 }
@@ -891,15 +889,8 @@ static bool virtualizeOnce(Function &F, unsigned layer) {
   Constant *poolInit = ConstantDataArray::get(Ctx, ArrayRef<uint64_t>(P.consts));
   auto *pool = new GlobalVariable(M, poolInit->getType(), false, GlobalValue::InternalLinkage,
                                   poolInit, rustcloak::anon("vp"));
-  // the callee table: a function-pointer array the CALL opcode indexes
+  // callees are invoked by a per-callee typed switch in OP_CALL (no runtime pointer table).
   Type *ptrTy = PointerType::get(Ctx, 0);
-  ArrayType *ctTy = ArrayType::get(ptrTy, std::max<size_t>(callees.size(), 1));
-  GlobalVariable *calleeTable = nullptr;
-  if (!callees.empty()) {
-    std::vector<Constant *> cv(callees.begin(), callees.end());
-    calleeTable = new GlobalVariable(M, ctTy, false, GlobalValue::InternalLinkage,
-                                     ConstantArray::get(ctTy, cv), rustcloak::anon("vc"));
-  }
   // nested layer: a pointer table of the referenced data globals the OP_GLOBAL opcode indexes
   ArrayType *gtTy = ArrayType::get(ptrTy, std::max<size_t>(P.globals.size(), 1));
   GlobalVariable *globalTable = nullptr;
@@ -1103,18 +1094,63 @@ static bool virtualizeOnce(Function &F, unsigned layer) {
       finish(pc4);
       continue;
     }
-    if (base == OP_CALL && calleeTable) {
-      // reg[dst] = calleetable[ra](argbuf[0..5]); a uniform i64(i64x6) thunk is ABI-safe for the
-      // <=6 integer/pointer args the eligibility check guarantees.
-      Value *fp = B.CreateLoad(ptrTy, B.CreateGEP(ctTy, calleeTable, {B.getInt64(0), ra}));
-      FunctionType *thunk = FunctionType::get(i64, {i64, i64, i64, i64, i64, i64}, false);
-      SmallVector<Value *, 6> cargs;
-      for (unsigned k = 0; k < 6; k++)
-        cargs.push_back(B.CreateLoad(i64, B.CreateGEP(argbufTy, argbuf, {B.getInt64(0), B.getInt64(k)})));
-      Value *res = B.CreateCall(thunk, fp, cargs);
-      if (wbits < 64)                      // narrow int return: re-establish the zero-extended lane
-        res = B.CreateZExt(B.CreateTrunc(res, iW), i64);
-      storeReg(dst, res);
+    if (base == OP_CALL && !callees.empty()) {
+      // Per-callee TYPED dispatch: switch on the callee index, emit a real typed call for each,
+      // reconstruct args from the staged lane bits (ptr<-int, float<-low 32 bits, double<-bits) and
+      // fold the result back into the i64 lane. A normal typed call lets the backend place
+      // integer/pointer/float args and the return value in the right ABI slots -- correct for float
+      // args, >6 args and float/odd-width returns, which the old uniform i64(i64x6) thunk could not.
+      Type *i32t = Type::getInt32Ty(Ctx);
+      BasicBlock *merge = BasicBlock::Create(Ctx, "", &F, bad);
+      SwitchInst *csw = B.CreateSwitch(ra, merge, callees.size());
+      std::vector<std::pair<Value *, BasicBlock *>> inc;
+      for (unsigned ci2 = 0; ci2 < callees.size(); ci2++) {
+        Function *cal = callees[ci2];
+        FunctionType *FT = cal->getFunctionType();
+        BasicBlock *arm = BasicBlock::Create(Ctx, "", &F, merge);
+        csw->addCase(ConstantInt::get(cast<IntegerType>(i64), ci2), arm);
+        B.SetInsertPoint(arm);
+        SmallVector<Value *, 8> ca;
+        for (unsigned ai = 0; ai < FT->getNumParams(); ai++) {
+          Type *pt = FT->getParamType(ai);
+          Value *raw = B.CreateLoad(i64, B.CreateGEP(argbufTy, argbuf, {B.getInt64(0), B.getInt64(ai)}));
+          Value *av;
+          if (pt->isPointerTy())
+            av = B.CreateIntToPtr(raw, pt);
+          else if (pt->isDoubleTy())
+            av = B.CreateBitCast(raw, pt);
+          else if (pt->isFloatTy())
+            av = B.CreateBitCast(B.CreateTrunc(raw, i32t), pt);
+          else if (pt->isIntegerTy())
+            av = pt->getIntegerBitWidth() == 64 ? raw : (Value *)B.CreateTrunc(raw, pt);
+          else
+            av = raw;                       // unreachable: eligibility guarantees lane-typed args
+          ca.push_back(av);
+        }
+        Value *r = B.CreateCall(FT, cal, ca);
+        Type *rt = FT->getReturnType();
+        Value *lane;
+        if (rt->isVoidTy())
+          lane = B.getInt64(0);
+        else if (rt->isPointerTy())
+          lane = B.CreatePtrToInt(r, i64);
+        else if (rt->isDoubleTy())
+          lane = B.CreateBitCast(r, i64);
+        else if (rt->isFloatTy())
+          lane = B.CreateZExt(B.CreateBitCast(r, i32t), i64);
+        else if (rt->isIntegerTy())
+          lane = rt->getIntegerBitWidth() == 64 ? r : (Value *)B.CreateZExt(r, i64);
+        else
+          lane = B.getInt64(0);
+        inc.push_back({lane, B.GetInsertBlock()});
+        B.CreateBr(merge);
+      }
+      B.SetInsertPoint(merge);
+      PHINode *phi = B.CreatePHI(i64, inc.size() + 1);
+      for (auto &pr : inc)
+        phi->addIncoming(pr.first, pr.second);
+      phi->addIncoming(B.getInt64(0), h);   // switch default (unreached: ra is always a valid index)
+      storeReg(dst, phi);
       B.CreateStore(B.getInt64(0), argn);
       finish(pc4);
       continue;

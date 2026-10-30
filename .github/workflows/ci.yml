@@ -51,6 +51,10 @@ jobs:
 
       - name: Every flag COMBINATION stays behaviour-correct
         run: bash test/combos.sh
+      - name: Extended differential corpora (recursion/float/8-arg typed calls)
+        run: |
+          SECS=60 TARGET=vm_target2.c bash test/fuzz/difffuzz_vm.sh
+          SECS=60 TARGET=vm_target3.c bash test/fuzz/difffuzz_vm.sh
 
       - name: VM bytecode integrity (every byte-flip caught)
         run: bash test/tamper.sh
