@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later OR LicenseRef-Commercial
 //===- ImportHide.cpp - hide selected imports behind dlsym-by-name ----------===//
 //
 // RUSTCLOAK_HIDE_IMPORTS="name1,name2,...". Each named external function that is called directly in

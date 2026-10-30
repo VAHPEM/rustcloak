@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later OR LicenseRef-Commercial
 //===- License.cpp - license key gate (RUSTCLOAK_LICENSE) -------------------===//
 //
 // Build with RUSTCLOAK_LICENSE=<hex> set to the FNV-1a-64 of the valid license key. A constructor

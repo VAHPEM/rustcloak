@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //===- Subst.cpp - instruction substitution --------------------------------===//
 //
 // Replaces simple integer arithmetic/logic operators with longer, equivalent expressions, so the

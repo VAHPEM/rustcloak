@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //===- StrEnc.cpp - string-literal encryption ------------------------------===//
 //
 // Every private constant i8 string is encrypted in the object with a per-string keystream, the

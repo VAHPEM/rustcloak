@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //===- RustCloak.h - shared declarations for the RustCloak obfuscator -----===//
 //
 // RustCloak is an LLVM new-pass-manager plugin that hardens a program against
@@ -112,14 +113,19 @@ struct BogusPass : llvm::PassInfoMixin<BogusPass> {
   llvm::PreservedAnalyses run(llvm::Function &F, llvm::FunctionAnalysisManager &);
   static bool isRequired() { return true; }
 };
+// Premium tier (premium/Virt.cpp, AGPL-or-commercial): code virtualization.
+#ifdef RUSTCLOAK_PREMIUM
 struct VirtPass : llvm::PassInfoMixin<VirtPass> {
   llvm::PreservedAnalyses run(llvm::Function &F, llvm::FunctionAnalysisManager &);
   static bool isRequired() { return true; }
 };
+#endif
 struct ConstEncPass : llvm::PassInfoMixin<ConstEncPass> {
   llvm::PreservedAnalyses run(llvm::Function &F, llvm::FunctionAnalysisManager &);
   static bool isRequired() { return true; }
 };
+// Premium tier (premium/, AGPL-or-commercial): anti-tamper, partial-outline (VM), license, imphide.
+#ifdef RUSTCLOAK_PREMIUM
 struct AntiTamperPass : llvm::PassInfoMixin<AntiTamperPass> {
   llvm::PreservedAnalyses run(llvm::Module &M, llvm::ModuleAnalysisManager &);
   static bool isRequired() { return true; }
@@ -136,5 +142,6 @@ struct ImportHidePass : llvm::PassInfoMixin<ImportHidePass> {
   llvm::PreservedAnalyses run(llvm::Module &M, llvm::ModuleAnalysisManager &);
   static bool isRequired() { return true; }
 };
+#endif // RUSTCLOAK_PREMIUM
 
 #endif // RUSTCLOAK_H

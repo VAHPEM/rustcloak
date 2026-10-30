@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //===- Bogus.cpp - bogus control flow + opaque predicates ------------------===//
 //
 // Splits blocks and guards the real continuation with an *opaque predicate* -- a

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //===- Flatten.cpp - control-flow flattening -------------------------------===//
 //
 // Rewrites each function into the canonical flattened form: a switch-variable, a

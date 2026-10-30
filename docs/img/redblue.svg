@@ -1,0 +1,49 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 980 300" width="980" height="300" role="img" aria-label="RustCloak and rust-deobf red/blue loop">
+  <defs>
+    <style>
+      .t{font:600 15px 'Segoe UI',system-ui,-apple-system,Helvetica,Arial,sans-serif;fill:#e6edf3}
+      .s{font:400 12px 'Segoe UI',system-ui,-apple-system,Helvetica,Arial,sans-serif;fill:#9da7b3}
+      .lbl{font:700 12px ui-monospace,Menlo,Consolas,monospace;letter-spacing:.5px}
+      .note{font:500 13px 'Segoe UI',system-ui,sans-serif;fill:#6e7681}
+    </style>
+    <marker id="ar" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto"><path d="M0 0 L8 3 L0 6 Z" fill="#6e7681"/></marker>
+    <marker id="arr" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto"><path d="M0 0 L8 3 L0 6 Z" fill="#e5484d"/></marker>
+  </defs>
+  <rect width="980" height="300" rx="14" fill="#0d1117"/>
+  <rect x="1" y="1" width="978" height="298" rx="13" fill="none" stroke="#30363d"/>
+  <text class="t" x="34" y="40" style="font-size:18px">The product is the loop, not the obfuscator</text>
+
+  <!-- source -->
+  <rect x="34" y="78" width="150" height="76" rx="10" fill="#161b22" stroke="#30363d"/>
+  <text class="t" x="52" y="112">Your Rust /</text><text class="t" x="52" y="132">C/C++ code</text>
+
+  <!-- RustCloak (red) -->
+  <rect x="246" y="70" width="190" height="92" rx="12" fill="#2b1416" stroke="#e5484d" stroke-width="1.5"/>
+  <text class="lbl" x="266" y="98" fill="#e5484d">RED · RUSTCLOAK</text>
+  <text class="s" x="266" y="120">harden at LLVM-IR:</text>
+  <text class="s" x="266" y="138">flatten · strenc · MBA</text>
+  <text class="s" x="266" y="154">· virtualize · anti-tamper</text>
+
+  <!-- protected binary -->
+  <rect x="498" y="78" width="150" height="76" rx="10" fill="#161b22" stroke="#30363d"/>
+  <text class="t" x="516" y="112">Protected</text><text class="t" x="516" y="132">binary</text>
+
+  <!-- rust-deobf (blue) -->
+  <rect x="710" y="70" width="236" height="92" rx="12" fill="#0f1b2d" stroke="#4493f8" stroke-width="1.5"/>
+  <text class="lbl" x="730" y="98" fill="#4493f8">BLUE · RUST-DEOBF</text>
+  <text class="s" x="730" y="120">recover: strings, CFG,</text>
+  <text class="s" x="730" y="138">types, devirtualize —</text>
+  <text class="s" x="730" y="154">emulation + dataflow</text>
+
+  <!-- flow arrows -->
+  <line x1="184" y1="116" x2="242" y2="116" stroke="#6e7681" stroke-width="2" marker-end="url(#ar)"/>
+  <line x1="436" y1="116" x2="494" y2="116" stroke="#6e7681" stroke-width="2" marker-end="url(#ar)"/>
+  <line x1="648" y1="116" x2="706" y2="116" stroke="#6e7681" stroke-width="2" marker-end="url(#ar)"/>
+
+  <!-- feedback loop: measured recall back into RustCloak -->
+  <path d="M828 162 V228 H341 V166" fill="none" stroke="#e5484d" stroke-width="2" stroke-dasharray="6 5" marker-end="url(#arr)"/>
+  <rect x="470" y="206" width="290" height="44" rx="10" fill="#161b22" stroke="#30363d"/>
+  <text class="note" x="490" y="233">measured recall → what survived feeds the next build</text>
+
+  <text class="s" x="34" y="284" style="fill:#6e7681">Nobody else ships the obfuscator and its matched analyzer as one measured system.</text>
+</svg>

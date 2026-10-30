@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //===- Plugin.cpp - RustCloak pass-plugin registration ---------------------===//
 #include "RustCloak.h"
 
@@ -22,7 +23,9 @@ using namespace llvm;
 // Add the per-function transforms in order: virtualize first (so the interpreter it emits is then
 // itself substituted, given bogus flow and flattened), then substitute, add bogus flow, flatten.
 static void addFunctionTransforms(FunctionPassManager &FPM) {
+#ifdef RUSTCLOAK_PREMIUM
   FPM.addPass(VirtPass());
+#endif
   FPM.addPass(ConstEncPass());
   FPM.addPass(SubstPass());
   FPM.addPass(BogusPass());
@@ -39,18 +42,22 @@ llvm::PassPluginLibraryInfo getRustCloakPluginInfo() {
                   if (Name == "flatten") { FPM.addPass(FlattenPass()); return true; }
                   if (Name == "subst")   { FPM.addPass(SubstPass());   return true; }
                   if (Name == "bogus")   { FPM.addPass(BogusPass());   return true; }
-                  if (Name == "virt")    { FPM.addPass(VirtPass());    return true; }
                   if (Name == "constenc") { FPM.addPass(ConstEncPass()); return true; }
+#ifdef RUSTCLOAK_PREMIUM
+                  if (Name == "virt")    { FPM.addPass(VirtPass());    return true; }
                   if (Name == "partial")  { FPM.addPass(PartialOutlinePass()); return true; }
+#endif
                   return false;
                 });
             PB.registerPipelineParsingCallback(
                 [](StringRef Name, ModulePassManager &MPM,
                    ArrayRef<PassBuilder::PipelineElement>) {
                   if (Name == "strenc") { MPM.addPass(StrEncPass()); return true; }
+#ifdef RUSTCLOAK_PREMIUM
                   if (Name == "antitamper") { MPM.addPass(AntiTamperPass()); return true; }
                   if (Name == "license") { MPM.addPass(LicensePass()); return true; }
                   if (Name == "imphide") { MPM.addPass(ImportHidePass()); return true; }
+#endif
                   return false;
                 });
             // Automatic: loading the plugin into a default -O pipeline
@@ -61,15 +68,18 @@ llvm::PassPluginLibraryInfo getRustCloakPluginInfo() {
                   if (getenv("RUSTCLOAK_OFF"))
                     return;
                   MPM.addPass(StrEncPass());
+#ifdef RUSTCLOAK_PREMIUM
                   // Partial block-level virtualization runs as its OWN adaptor first, so every
                   // outlined function exists before the virt stage and gets virtualized there
                   // (RUSTCLOAK_VM_PARTIAL; no-op otherwise).
                   FunctionPassManager PFP;
                   PFP.addPass(PartialOutlinePass());
                   MPM.addPass(createModuleToFunctionPassAdaptor(std::move(PFP)));
+#endif
                   FunctionPassManager FPM;
                   addFunctionTransforms(FPM);
                   MPM.addPass(createModuleToFunctionPassAdaptor(std::move(FPM)));
+#ifdef RUSTCLOAK_PREMIUM
                   // license key gate and import hiding (RUSTCLOAK_LICENSE / RUSTCLOAK_HIDE_IMPORTS;
                   // no-ops unless their env var is set). BEFORE anti-tamper, so the integrity pass
                   // sections and hashes the license gate's constructor too -- otherwise that ctor
@@ -80,6 +90,7 @@ llvm::PassPluginLibraryInfo getRustCloakPluginInfo() {
                   // the license/imphide code), so it does not shrink virt eligibility and its
                   // self-check covers every injected gate (RUSTCLOAK_ANTITAMPER; needs the patcher).
                   MPM.addPass(AntiTamperPass());
+#endif
                 });
           }};
 }

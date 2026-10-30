@@ -1,11 +1,14 @@
 # CLAUDE.md — RustCloak
 
 LLVM new-pass-manager plugin that hardens programs against reverse engineering at the LLVM-IR
-level. Transforms in `src/`: function passes `flatten`, `subst`, `bogus`, `virt`, `constenc`,
-`partial` (outline); module passes `strenc`, `antitamper`, `license`, `imphide`; plus `Plugin.cpp`
-(registration) and `RustCloak.h` (seeded `anon()` names, per-build `rng`). It is the
-red/blue counterpart to **rust-deobf** and a test-case generator for it, so **behaviour must be
-preserved exactly**.
+level. **Two tiers:** the Apache-2.0 **core** in `src/` (function passes `flatten`, `subst`, `bogus`,
+`constenc`; module pass `strenc`; plus `Plugin.cpp` registration and `RustCloak.h` seeded `anon()`
+names + per-build `rng`), and the AGPL-or-commercial **premium** tier in `premium/` (function passes
+`virt`, `partial`; module passes `antitamper`, `license`, `imphide`). Premium builds in by default;
+`-DRUSTCLOAK_PREMIUM=OFF` yields a core-only Apache-2.0 plugin. The premium pass declarations in
+`RustCloak.h` and their registration in `Plugin.cpp` are guarded by `#ifdef RUSTCLOAK_PREMIUM`; the
+core never includes or links premium. It is the red/blue counterpart to **rust-deobf** and a
+test-case generator for it, so **behaviour must be preserved exactly**.
 
 ## Build + test run on the KALI VM, not the cloud container
 The cloud container has `clang-18`/`opt-18` but **not** `llvm-18-dev` (no CMake config, no headers)
@@ -16,7 +19,8 @@ The cloud container has `clang-18`/`opt-18` but **not** `llvm-18-dev` (no CMake 
 
 ```
 cmake -S . -B build -G Ninja -DLLVM_DIR="$(llvm-config-18 --cmakedir)"
-cmake --build build          # -> build/libRustCloak.so
+cmake --build build          # -> build/libRustCloak.so  (premium tier ON by default)
+# core-only (Apache-2.0, no VM/antitamper/license/imphide):  add -DRUSTCLOAK_PREMIUM=OFF
 ```
 
 Native target is **aarch64 ELF**. State which arch you actually ran — don't assume another

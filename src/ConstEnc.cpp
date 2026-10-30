@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //===- ConstEnc.cpp - integer constant obfuscation -------------------------===//
 //
 // Hides integer literal operands: a constant C is replaced by `C ^ z`, where `z` is an opaque ZERO

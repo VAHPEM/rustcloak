@@ -1,0 +1,33 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1000 240" width="1000" height="240" role="img" aria-label="RustCloak">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#0d1117"/><stop offset="1" stop-color="#161b22"/>
+    </linearGradient>
+    <linearGradient id="shield" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#e5484d"/><stop offset="1" stop-color="#4493f8"/>
+    </linearGradient>
+    <style>
+      .wm{font:700 56px 'Segoe UI',system-ui,-apple-system,Helvetica,Arial,sans-serif;fill:#e6edf3}
+      .tag{font:400 20px 'Segoe UI',system-ui,-apple-system,Helvetica,Arial,sans-serif;fill:#9da7b3}
+      .sub{font:500 13px ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;fill:#6e7681;letter-spacing:.5px}
+      .byte{font:600 13px ui-monospace,Menlo,Consolas,monospace;fill:#0d1117;opacity:.55}
+    </style>
+  </defs>
+  <rect width="1000" height="240" rx="16" fill="url(#bg)"/>
+  <rect x="1" y="1" width="998" height="238" rx="15" fill="none" stroke="#30363d" stroke-width="1"/>
+  <!-- shield / cloak glyph -->
+  <g transform="translate(70,48)">
+    <path d="M72 0 L144 26 V76 C144 118 110 140 72 150 C34 140 0 118 0 76 V26 Z" fill="url(#shield)"/>
+    <path d="M72 0 L144 26 V76 C144 118 110 140 72 150 Z" fill="#000" opacity="0.14"/>
+    <text class="byte" x="30" y="60">01001</text>
+    <text class="byte" x="26" y="80">10110</text>
+    <text class="byte" x="34" y="100">01101</text>
+    <circle cx="72" cy="70" r="15" fill="#0d1117" opacity="0.85"/>
+    <rect x="68" y="70" width="8" height="20" rx="3" fill="#0d1117" opacity="0.85"/>
+  </g>
+  <!-- wordmark -->
+  <text class="wm" x="250" y="100">RustCloak</text>
+  <text class="tag" x="252" y="136">LLVM-IR hardening for Rust &amp; C/C++</text>
+  <text class="sub" x="252" y="176">control-flow flattening · string encryption · MBA · bytecode virtualization</text>
+  <text class="sub" x="252" y="198">measured against rust-deobf  ·  Apache-2.0 core + AGPL/commercial premium</text>
+</svg>
