@@ -23,11 +23,12 @@ lane-typed/void return.
   `test/fuzz/vm_target3.c` (3 float args, 8 int args, mixed int/float/double/ptr args, float/double/
   long returns) confirmed virtualized; **4.79M-iteration** coverage-guided differential fuzz, zero
   divergence.
-- **x86-64 SysV and Windows x64 (Win64): PENDING.** Could not be built on the ARM64 lab host (no
-  x86_64 sysroot, no wine). CI (`.github/workflows/ci.yml`, ubuntu x86_64 native) now runs the
-  `vm_target2`/`vm_target3` differentials, which exercises SysV. **Before relying on the typed-call
-  path on those targets, confirm CI green and run a longer soak** (`SECS=7200 TARGET=vm_target3.c
-  bash test/fuzz/difffuzz_vm.sh`) and `test/matrix.sh` on an x86_64 host.
+- **x86-64 SysV: PASS (verified directly).** Built the plugin natively on x86_64 Ubuntu 24.04
+  (llvm-18.1.3) and ran difftest 6/6 + the `vm_target3` (float/XMM, 8 stacked args) and `vm_target4`
+  (indirect) differentials -- zero divergence. This is the ABI most unlike AArch64 (float args in
+  XMM, >6 args on the stack), so it was the key check.
+- **Windows x64 (Win64): still pending** (no wine on the lab host); covered by CI or an x86-64
+  Windows host. A longer multi-hour soak is optional insurance, not a blocker.
 
 ## Done — indirect calls (hole #4)
 `OP_CALLV` holds the callee pointer in a register and the call site's `FunctionType` in a per-build
@@ -41,7 +42,8 @@ branch to a plain tail (no merge PHI), so nested re-virtualization -- which lowe
 branch chain -- has no cross-block PHI edge to invalidate.
 
 Verification: AArch64 PASS -- difftest 6/6, combos 20/20 (incl. nested VM), 13.2M-iteration
-differential fuzz on vm_target4, zero divergence. x86-64/Win64 via CI as for the direct path.
+differential fuzz on vm_target4, zero divergence. x86-64 SysV verified directly (difftest 6/6 +
+vm_target3/vm_target4 differentials on x86_64 Ubuntu); Win64 pending (no wine locally).
 
 ## Nothing left open
 All of eligible()'s call holes are closed. Any further work is on non-call ops (none currently
