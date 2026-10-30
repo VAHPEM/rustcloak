@@ -70,13 +70,16 @@ llvm::PassPluginLibraryInfo getRustCloakPluginInfo() {
                   FunctionPassManager FPM;
                   addFunctionTransforms(FPM);
                   MPM.addPass(createModuleToFunctionPassAdaptor(std::move(FPM)));
-                  // anti-tamper LAST: section + rc_k-keyed constants over the final code, so it does
-                  // not shrink virt eligibility (RUSTCLOAK_ANTITAMPER; needs the post-link patcher).
-                  MPM.addPass(AntiTamperPass());
                   // license key gate and import hiding (RUSTCLOAK_LICENSE / RUSTCLOAK_HIDE_IMPORTS;
-                  // no-ops unless their env var is set).
+                  // no-ops unless their env var is set). BEFORE anti-tamper, so the integrity pass
+                  // sections and hashes the license gate's constructor too -- otherwise that ctor
+                  // (the single point that sets lic_k) could be NOP'd to force a permanent unlock.
                   MPM.addPass(LicensePass());
                   MPM.addPass(ImportHidePass());
+                  // anti-tamper LAST: section + rc_k-keyed constants over the FINAL code (now incl.
+                  // the license/imphide code), so it does not shrink virt eligibility and its
+                  // self-check covers every injected gate (RUSTCLOAK_ANTITAMPER; needs the patcher).
+                  MPM.addPass(AntiTamperPass());
                 });
           }};
 }
