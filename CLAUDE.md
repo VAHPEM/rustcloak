@@ -13,9 +13,10 @@ test-case generator for it, so **behaviour must be preserved exactly**.
 ## Build + test run on the KALI VM, not the cloud container
 The cloud container has `clang-18`/`opt-18` but **not** `llvm-18-dev` (no CMake config, no headers)
 → the plugin cannot be built there. The toolchain (`clang-18`, `opt-18`, `llvm-config-18`, `cmake`,
-`ninja`) lives on the **ARM64 Kali VM**, driven through the `dualvm` package on the Mac
-(`dual-vm-ai-agent/`; read its CLAUDE.md). From a Cowork session, push sources to Kali (base64 over
-`dualvm.shell.run_script`) and build there:
+`ninja`) lives on the **ARM64 Kali VM**, driven through the `labhand` package on the Mac
+(formerly `dualvm`; the checkout is still the `dual-vm-ai-agent/` folder; read its CLAUDE.md). From a
+Cowork session, push sources to Kali (`labhand.shell.upload_file`, or base64 over
+`labhand.shell.run_script`) and build there:
 
 ```
 cmake -S . -B build -G Ninja -DLLVM_DIR="$(llvm-config-18 --cmakedir)"
